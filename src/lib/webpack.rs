@@ -1,7 +1,7 @@
 use oxc::allocator::Allocator;
 use oxc::ast::ast::{
-    AssignmentExpression, AssignmentTarget, Expression, MemberExpression, ObjectExpression,
-    ObjectPropertyKind, PropertyKey,
+    AssignmentExpression, AssignmentTarget, Expression, ObjectExpression, ObjectPropertyKind,
+    PropertyKey,
 };
 use oxc::ast_visit::{Visit, walk};
 use oxc::parser::Parser;
@@ -31,8 +31,8 @@ impl<'a> ChunkMapVisitor<'a> {
 fn property_key_to_string(key: &PropertyKey) -> Option<String> {
     match key {
         PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
-        PropertyKey::INHERIT(Expression::StringLiteral(s)) => Some(s.value.to_string()),
-        PropertyKey::INHERIT(Expression::NumericLiteral(n)) => Some(n.raw?.to_string()),
+        PropertyKey::StringLiteral(s) => Some(s.value.to_string()),
+        PropertyKey::NumericLiteral(n) => Some(n.raw?.to_string()),
         _ => None,
     }
 }
@@ -61,13 +61,9 @@ fn object_expression_to_chunk_map(obj: &ObjectExpression) -> Option<ChunkMap> {
 /// Is the assignment target `something.u` / `something["u"]`, i.e. webpack's chunk
 /// filename resolver (`__webpack_require__.u`)?
 fn is_chunk_filename_target(target: &AssignmentTarget, member_name: &str) -> bool {
-    let AssignmentTarget::MemberExpression(member) = target else {
-        return false;
-    };
-
-    match member.as_ref() {
-        MemberExpression::StaticMemberExpression(m) => m.property.name == member_name,
-        MemberExpression::ComputedMemberExpression(m) => {
+    match target {
+        AssignmentTarget::StaticMemberExpression(m) => m.property.name == member_name,
+        AssignmentTarget::ComputedMemberExpression(m) => {
             matches!(&m.expression, Expression::StringLiteral(s) if s.value == member_name)
         }
         _ => false,
@@ -100,15 +96,20 @@ fn find_chunk_map_in_expression(expr: &Expression) -> Option<ChunkMap> {
 }
 
 impl<'a> Visit<'a> for ChunkMapVisitor<'a> {
+    // we need a visit_assignment_expression to visit all the assignments
+    // in order to locate
+    /// __webpack__require.u = chunkId =>
+    /// which will give us the chunkIds
     fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
         if self.chunk_map.is_none() && is_chunk_filename_target(&it.left, "u") {
             self.chunk_map = find_chunk_map_in_expression(&it.right);
         }
 
-        if self.public_path.is_none() && is_public_path_target(&it.left) {
-            if let Expression::StringLiteral(s) = &it.right {
-                self.public_path = Some(s.value.to_string());
-            }
+        if self.public_path.is_none()
+            && is_public_path_target(&it.left)
+            && let Expression::StringLiteral(s) = &it.right
+        {
+            self.public_path = Some(s.value.to_string());
         }
 
         walk::walk_assignment_expression(self, it);
@@ -122,14 +123,17 @@ impl<'a> Visit<'a> for ChunkMapVisitor<'a> {
 /// (e.g. it isn't the webpack runtime chunk, or the build uses a codegen shape
 /// other than an inline chunk-id -> hash object literal).
 pub fn extract_chunk_map(source: &str) -> Option<(ChunkMap, Option<String>)> {
+    // create allocator
     let allocator = Allocator::default();
+    // use default source_type
     let source_type = SourceType::default();
+    // parse source string
     let parsed = Parser::new(&allocator, source, source_type).parse();
-
+    // none if panicked
     if parsed.panicked {
         return None;
     }
-
+    // create a visitor
     let mut visitor = ChunkMapVisitor::new();
     visitor.visit_program(&parsed.program);
 

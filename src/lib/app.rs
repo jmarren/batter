@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
+use oxc::ast::ast::PropertyKey;
 use std::fmt::Debug;
 use tokio::task::JoinSet;
 // use futures::future::join_all;
@@ -130,10 +131,12 @@ impl App {
             .collect();
 
         for (src, bytes) in fetched {
+            // convert bytes to string
             let Ok(text) = std::str::from_utf8(bytes) else {
                 continue;
             };
 
+            //
             let Some((chunk_map, public_path)) = webpack::extract_chunk_map(text) else {
                 continue;
             };
