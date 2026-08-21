@@ -1,5 +1,6 @@
 use anyhow::Result;
 use scraper::{Html, Selector};
+use std::collections::HashSet;
 
 pub struct Document {
     document: Html,
@@ -18,13 +19,30 @@ impl Document {
         let scripts: Vec<_> = self.document.select(&script_selector).collect();
         tracing::info!("found {} <script src> sources in document", scripts.len());
 
-        let srcs: Vec<_> = scripts
+        let mut srcs: HashSet<_> = scripts
             .iter()
             .map(|s| s.value().attr("src"))
             .filter(|s| s.is_some())
             .map(|s| s.unwrap().to_string())
             .collect();
 
-        srcs
+        let link_script_selector = Selector::parse("link[as='script']").unwrap();
+
+        let link_scripts: Vec<_> = self.document.select(&link_script_selector).collect();
+        tracing::info!(
+            "found {} <script src> sources in document",
+            link_scripts.len()
+        );
+
+        let link_srcs: HashSet<_> = link_scripts
+            .iter()
+            .map(|s| s.value().attr("href"))
+            .filter(|s| s.is_some())
+            .map(|s| s.unwrap().to_string())
+            .collect();
+
+        srcs.extend(link_srcs);
+
+        srcs.into_iter().collect()
     }
 }

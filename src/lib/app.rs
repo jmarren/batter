@@ -8,6 +8,7 @@ use std::path::PathBuf;
 mod html;
 mod site;
 mod util;
+mod webpack;
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -19,7 +20,6 @@ struct Cli {
 struct App {
     domain: String,
     out_dir: PathBuf,
-    js_sources: Vec<String>,
 }
 
 impl App {
@@ -29,7 +29,6 @@ impl App {
         Ok(Self {
             out_dir,
             domain: cli.domain,
-            js_sources: vec![],
         })
     }
 
@@ -61,7 +60,7 @@ impl App {
         html::Document::new(&res)
     }
 
-    async fn fetch_js_sources(&self, sources: &[String]) -> Result<()> {
+    async fn fetch_js_sources(&self, sources: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
         let mut join_set = JoinSet::new();
 
         // spawn a task to fetch each source found
@@ -76,6 +75,7 @@ impl App {
         // let alloc = oxc::allocator::Allocator::new();
 
         let mut prettier_set = JoinSet::new();
+        let mut fetched = Vec::new();
 
         // iterate over results and write to file if ok
         while let Some(task_result) = join_set.join_next().await {
@@ -89,9 +89,13 @@ impl App {
                 continue;
             };
 
+            // TODO: pass string to prettier command before writing instead of editing file in
+            // place
             self.write_file(src.clone().into(), &bytes).await?;
 
             let written_path = self.out_dir.join(&src);
+
+            tracing::info!("written_path = {:?}", written_path);
 
             // spawn a task to run prettier on this file so files can be formatted in parallel
             prettier_set.spawn(async move {
@@ -102,14 +106,58 @@ impl App {
                     .status()
                     .await
             });
+
+            fetched.push((src, bytes));
         }
 
-        // join all prettier tasks so none are left running as orphans
+        // // join all prettier tasks so none are left running as orphans
         while let Some(task_result) = prettier_set.join_next().await {
+            println!("task_result = {:?}", task_result);
             let _ = task_result?;
         }
 
-        Ok(())
+        Ok(fetched)
+    }
+
+    // scans fetched js bundles for a webpack chunk map, and logs any chunk whose
+    // filename wasn't among the sources we already fetched
+    fn report_missing_chunks(&self, fetched: &[(String, Vec<u8>)]) {
+        // compare by basename since fetched sources are full (domain-prefixed) urls
+        // while reconstructed chunk filenames are not
+        let fetched_basenames: std::collections::HashSet<&str> = fetched
+            .iter()
+            .filter_map(|(src, _)| src.rsplit('/').next())
+            .collect();
+
+        for (src, bytes) in fetched {
+            let Ok(text) = std::str::from_utf8(bytes) else {
+                continue;
+            };
+
+            let Some((chunk_map, public_path)) = webpack::extract_chunk_map(text) else {
+                continue;
+            };
+
+            tracing::info!(
+                "found webpack chunk map with {} entries in {}",
+                chunk_map.len(),
+                src
+            );
+
+            let known = webpack::chunk_filenames(&chunk_map, public_path.as_deref());
+
+            let missing: Vec<&String> = known
+                .iter()
+                .filter(|filename| {
+                    let basename = filename.rsplit('/').next().unwrap_or(filename.as_str());
+                    !fetched_basenames.contains(basename)
+                })
+                .collect();
+
+            if !missing.is_empty() {
+                tracing::warn!("missing chunks referenced by {}: {:?}", src, missing);
+            }
+        }
     }
 
     async fn run(&mut self) -> Result<()> {
@@ -118,12 +166,11 @@ impl App {
         // get js sources from html
         let sources = html.sources();
 
-        // add sources to self.js_sources
-        // self.js_sources.extend(sources);
+        let fetched = self.fetch_js_sources(&sources).await?;
 
-        self.fetch_js_sources(&sources).await?;
+        self.report_missing_chunks(&fetched);
 
-        tracing::info!("sources = {:?}", self.js_sources);
+        tracing::info!("sources = {:?}", sources);
 
         Ok(())
     }
