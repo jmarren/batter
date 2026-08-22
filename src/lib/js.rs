@@ -3,8 +3,8 @@ use oxc::{
     allocator::Allocator,
     ast::ast::{
         ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, BindingPattern,
-        ConditionalExpression, Expression, ObjectExpression, ObjectPropertyKind, PropertyKey,
-        Statement,
+        ComputedMemberExpression, ConditionalExpression, Expression, ObjectExpression,
+        ObjectPropertyKind, PropertyKey, Statement,
     },
     ast_visit::Visit,
     parser::Parser,
@@ -105,60 +105,67 @@ fn chunk_urls<'a>(arrow_fn: &oxc::allocator::Box<'a, ArrowFunctionExpression<'a>
         return;
     };
 
-    let mut out = vec![];
-    flatten_binary_plus_chain(body, &mut out);
+    let mut flattened = vec![];
+    flatten_binary_plus_chain(body, &mut flattened);
 
-    out.iter().for_each(|e| {
-        match e {
-            Expression::StringLiteral(s) => match s.raw {
-                Some(raw) if raw == "." => {
-                    println!("got dot");
-                }
-                Some(raw) => {
-                    println!("raw = {:?}", raw);
-                }
-                _ => (),
-            },
-            Expression::ConditionalExpression(c) => {
-                println!("c = {:?}", c);
+    let mut consequent: String = "".into();
+    let mut props: Vec<(String, String)> = vec![];
+
+    flattened.iter().for_each(|e| match e {
+        Expression::StringLiteral(s) => match s.raw {
+            Some(raw) if raw != "\".\"" && raw != "\".js\"" => {
+                println!("raw = {:?}", raw);
             }
-            Expression::ParenthesizedExpression(p) => match &p.expression {
-                Expression::ConditionalExpression(c) => match &c.consequent {
-                    Expression::StringLiteral(s) => {
-                        println!("consequent = {:?}", s.raw);
+            _ => (),
+        },
+        Expression::ConditionalExpression(c) => {
+            println!("c = {:?}", c);
+        }
+        Expression::ParenthesizedExpression(p) => match &p.expression {
+            Expression::ConditionalExpression(c) => match &c.consequent {
+                Expression::StringLiteral(s) => {
+                    if let Some(c) = s.raw {
+                        consequent = c.into();
                     }
-                    _ => (),
-                },
-                _ => (),
-            },
-            Expression::Identifier(id) => {
-                println!("identifier = {:?}", id.name);
-            }
-            Expression::ComputedMemberExpression(m) => match &m.object {
-                Expression::ParenthesizedExpression(p) => match &p.expression {
-                    Expression::ObjectExpression(o) => {
-                        o.properties.iter().for_each(|prop| match &prop {
-                            ObjectPropertyKind::ObjectProperty(object_prop) => {
-                                match &object_prop.value {
-                                    Expression::StringLiteral(val) => {
-                                        if let Some(v) = val.raw {
-                                            println!("object_prop.value = {}", v);
-                                        }
-                                    }
-                                    _ => (),
-                                }
-                            }
-                            _ => (),
-                        });
-                    }
-                    _ => (),
-                },
+                }
                 _ => (),
             },
             _ => (),
+        },
+        Expression::ComputedMemberExpression(m) => {
+            props = object_props(m);
         }
-        // println!("{}", e);
+        _ => (),
     });
+
+    println!("consequent = {:?}", consequent);
+    println!("props = {:?}", props);
+}
+
+fn object_props(computed: &ComputedMemberExpression) -> Vec<(String, String)> {
+    let mut out = vec![];
+    match &computed.object {
+        Expression::ParenthesizedExpression(p) => match &p.expression {
+            Expression::ObjectExpression(o) => {
+                o.properties.iter().for_each(|prop| match &prop {
+                    ObjectPropertyKind::ObjectProperty(object_prop) => {
+                        match (&object_prop.value, &object_prop.key) {
+                            (Expression::StringLiteral(val), PropertyKey::NumericLiteral(k)) => {
+                                if let Some(v) = val.raw {
+                                    out.push((k.value.round().to_string(), v.into()));
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+                    _ => (),
+                });
+            }
+            _ => (),
+        },
+        _ => (),
+    }
+    out
 }
 
 // /// The chunk id -> filename-fragment map read out of webpack's `.u` resolver body,
