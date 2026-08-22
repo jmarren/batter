@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
@@ -49,10 +50,12 @@ impl Site {
     // handle source urls returned from document
     async fn handle_sources(&self, sources: &[String]) -> Result<()> {
         let mut join_set = JoinSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
 
         // spawn a task to fetch each source found
         for i in 0..sources.len() {
             let src = format!("{}{}", self.domain, sources[i]);
+            seen.insert(src.clone());
             join_set.spawn(async move {
                 let res = util::fetch_url(&src).await;
                 (res, src)
@@ -62,7 +65,26 @@ impl Site {
         while let Some(task_result) = join_set.join_next().await {
             // ignore errors so we don't stop prematurely
             // TODO: log errors
-            let _ = self.handle_source_response(task_result).await;
+            let Ok(chunk_urls) = self.handle_source_response(task_result).await else {
+                // tracing::error!("failed to handle chunk: {:?}", task_result.err());
+                continue;
+            };
+
+            // spawn a task for any newly discovered chunk we haven't already seen
+            for chunk_url in chunk_urls {
+                let src = format!("{}/_next/{}", self.domain, chunk_url);
+
+                tracing::info!("discovered {}", src);
+
+                if !seen.insert(src.clone()) {
+                    continue;
+                }
+
+                join_set.spawn(async move {
+                    let res = util::fetch_url(&src).await;
+                    (res, src)
+                });
+            }
         }
 
         Ok(())
@@ -71,10 +93,11 @@ impl Site {
     // handle javascript returned from source url
     // - write to file
     // - parse
+    // - return any chunk urls discovered while parsing
     async fn handle_source_response(
         &self,
         task_result: Result<(Result<Vec<u8>>, String), JoinError>,
-    ) -> Result<()> {
+    ) -> Result<HashSet<String>> {
         let Ok((Ok(bytes), src)) = task_result else {
             return Err(anyhow!("task failed"));
         };
@@ -88,10 +111,8 @@ impl Site {
         // create new JsSource object from data
         let js_source = JsSource::new(String::from_utf8(bytes)?);
 
-        // parse the source
-        js_source.parse()?;
-
-        Ok(())
+        // parse the source and return any chunk urls found
+        js_source.parse()
     }
 
     async fn write_index(&self, data: &[u8]) -> Result<()> {

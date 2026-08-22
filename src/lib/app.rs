@@ -38,49 +38,6 @@ impl App {
         })
     }
 
-    // scans fetched js bundles for a webpack chunk map, and logs any chunk whose
-    // filename wasn't among the sources we already fetched
-    fn report_missing_chunks(&self, fetched: &[(String, Vec<u8>)]) {
-        // compare by basename since fetched sources are full (domain-prefixed) urls
-        // while reconstructed chunk filenames are not
-        let fetched_basenames: std::collections::HashSet<&str> = fetched
-            .iter()
-            .filter_map(|(src, _)| src.rsplit('/').next())
-            .collect();
-
-        for (src, bytes) in fetched {
-            // convert bytes to string
-            let Ok(text) = std::str::from_utf8(bytes) else {
-                continue;
-            };
-
-            //
-            let Some((chunk_map, public_path)) = webpack::extract_chunk_map(text) else {
-                continue;
-            };
-
-            tracing::info!(
-                "found webpack chunk map with {} entries in {}",
-                chunk_map.len(),
-                src
-            );
-
-            let known = webpack::chunk_filenames(&chunk_map, public_path.as_deref());
-
-            let missing: Vec<&String> = known
-                .iter()
-                .filter(|filename| {
-                    let basename = filename.rsplit('/').next().unwrap_or(filename.as_str());
-                    !fetched_basenames.contains(basename)
-                })
-                .collect();
-
-            if !missing.is_empty() {
-                tracing::warn!("missing chunks referenced by {}: {:?}", src, missing);
-            }
-        }
-    }
-
     async fn run(&mut self) -> Result<()> {
         self.site.enumerate().await?;
 
@@ -231,3 +188,47 @@ pub async fn run() {
 //
 //     Ok(fetched)
 // }
+// //
+//     // scans fetched js bundles for a webpack chunk map, and logs any chunk whose
+//     // filename wasn't among the sources we already fetched
+//     fn report_missing_chunks(&self, fetched: &[(String, Vec<u8>)]) {
+//         // compare by basename since fetched sources are full (domain-prefixed) urls
+//         // while reconstructed chunk filenames are not
+//         let fetched_basenames: std::collections::HashSet<&str> = fetched
+//             .iter()
+//             .filter_map(|(src, _)| src.rsplit('/').next())
+//             .collect();
+//
+//         for (src, bytes) in fetched {
+//             // convert bytes to string
+//             let Ok(text) = std::str::from_utf8(bytes) else {
+//                 continue;
+//             };
+//
+//             //
+//             let Some((chunk_map, public_path)) = webpack::extract_chunk_map(text) else {
+//                 continue;
+//             };
+//
+//             tracing::info!(
+//                 "found webpack chunk map with {} entries in {}",
+//                 chunk_map.len(),
+//                 src
+//             );
+//
+//             let known = webpack::chunk_filenames(&chunk_map, public_path.as_deref());
+//
+//             let missing: Vec<&String> = known
+//                 .iter()
+//                 .filter(|filename| {
+//                     let basename = filename.rsplit('/').next().unwrap_or(filename.as_str());
+//                     !fetched_basenames.contains(basename)
+//                 })
+//                 .collect();
+//
+//             if !missing.is_empty() {
+//                 tracing::warn!("missing chunks referenced by {}: {:?}", src, missing);
+//             }
+//         }
+//     }
+//

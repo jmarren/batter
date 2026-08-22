@@ -23,7 +23,7 @@ impl JsSource {
         Self { source_text }
     }
 
-    pub fn parse(&self) -> Result<()> {
+    pub fn parse(&self) -> Result<HashSet<String>> {
         // create allocator
         let allocator = Allocator::default();
         // use default source_type
@@ -39,9 +39,7 @@ impl JsSource {
 
         walker.visit_program(&parsed.program);
 
-        println!("chunk_urls = {:?}", walker.chunk_urls);
-
-        Ok(())
+        Ok(walker.chunk_urls)
     }
 }
 
