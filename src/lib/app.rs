@@ -1,12 +1,14 @@
 use anyhow::Result;
 use clap::Parser;
-use oxc::ast::ast::PropertyKey;
 use std::fmt::Debug;
-use tokio::task::JoinSet;
-// use futures::future::join_all;
 use std::path::PathBuf;
+use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::task::JoinSet;
+
+use crate::site::Site;
 
 mod html;
+mod js;
 mod site;
 mod util;
 mod webpack;
@@ -20,104 +22,20 @@ struct Cli {
 
 struct App {
     domain: String,
-    out_dir: PathBuf,
+    site: Site,
 }
 
 impl App {
     fn from_cli(cli: Cli) -> Result<Self> {
         let out_dir = util::full_path(cli.out_dir)?;
 
+        let site = Site::new(out_dir, cli.domain.clone());
+
         Ok(Self {
-            out_dir,
+            // out_dir,
             domain: cli.domain,
+            site,
         })
-    }
-
-    // writes provided bytes to provided file path relative to self.out_dir
-    async fn write_file(&self, path: PathBuf, bytes: &[u8]) -> Result<()> {
-        let full_path = self.out_dir.join(path);
-
-        // get last directory of path
-        if let Some(parent) = full_path.parent() {
-            // if it doesn't exist, create it
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        // write the file
-        tokio::fs::write(full_path, bytes).await?;
-
-        Ok(())
-    }
-
-    async fn fetch_html(&self) -> Result<html::Document> {
-        // fetch the site
-        let res = site::fetch_url(&self.domain).await?;
-
-        // write it to file
-        self.write_file(format!("{}/index.html", self.domain).into(), &res)
-            .await?;
-
-        // create html document
-        html::Document::new(&res)
-    }
-
-    async fn fetch_js_sources(&self, sources: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
-        let mut join_set = JoinSet::new();
-
-        // spawn a task to fetch each source found
-        for i in 0..sources.len() {
-            let src = format!("{}{}", self.domain, sources[i]);
-            join_set.spawn(async move {
-                let res = site::fetch_url(&src).await;
-                (res, src)
-            });
-        }
-
-        // let alloc = oxc::allocator::Allocator::new();
-
-        let mut prettier_set = JoinSet::new();
-        let mut fetched = Vec::new();
-
-        // iterate over results and write to file if ok
-        while let Some(task_result) = join_set.join_next().await {
-            let Ok(out) = task_result else {
-                continue;
-            };
-
-            let (res, src) = out;
-
-            let Ok(bytes) = res else {
-                continue;
-            };
-
-            // TODO: pass string to prettier command before writing instead of editing file in
-            // place
-            self.write_file(src.clone().into(), &bytes).await?;
-
-            let written_path = self.out_dir.join(&src);
-
-            tracing::info!("written_path = {:?}", written_path);
-
-            // spawn a task to run prettier on this file so files can be formatted in parallel
-            prettier_set.spawn(async move {
-                tokio::process::Command::new("npx")
-                    .arg("prettier")
-                    .arg("--write")
-                    .arg(&written_path)
-                    .status()
-                    .await
-            });
-
-            fetched.push((src, bytes));
-        }
-
-        // // join all prettier tasks so none are left running as orphans
-        while let Some(task_result) = prettier_set.join_next().await {
-            println!("task_result = {:?}", task_result);
-            let _ = task_result?;
-        }
-
-        Ok(fetched)
     }
 
     // scans fetched js bundles for a webpack chunk map, and logs any chunk whose
@@ -164,16 +82,7 @@ impl App {
     }
 
     async fn run(&mut self) -> Result<()> {
-        let html = self.fetch_html().await?;
-
-        // get js sources from html
-        let sources = html.sources();
-
-        let fetched = self.fetch_js_sources(&sources).await?;
-
-        self.report_missing_chunks(&fetched);
-
-        tracing::info!("sources = {:?}", sources);
+        self.site.enumerate().await?;
 
         Ok(())
     }
@@ -255,3 +164,70 @@ pub async fn run() {
 // // parser_return.
 //
 // println!("parser_return = {:?}", parser_return);
+//
+//
+// async fn fetch_js_sources(&self, sources: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
+//     let mut join_set = JoinSet::new();
+//
+//     // spawn a task to fetch each source found
+//     for i in 0..sources.len() {
+//         let src = format!("{}{}", self.domain, sources[i]);
+//         join_set.spawn(async move {
+//             let res = util::fetch_url(&src).await;
+//             (res, src)
+//         });
+//     }
+//
+//     // let alloc = oxc::allocator::Allocator::new();
+//
+//     let mut prettier_set = JoinSet::new();
+//     let mut fetched = Vec::new();
+//
+//     // iterate over results and write to file if ok
+//     while let Some(task_result) = join_set.join_next().await {
+//         let Ok(out) = task_result else {
+//             continue;
+//         };
+//
+//         let (res, src) = out;
+//
+//         let Ok(bytes) = res else {
+//             continue;
+//         };
+//
+//         // TODO: pass string to prettier command before writing instead of editing file in
+//         // place
+//
+//         let src = if src.ends_with(".js") {
+//             src
+//         } else {
+//             format!("{src}.js")
+//         };
+//
+//         self.write_file(src.clone().into(), &bytes).await?;
+//
+//         let written_path = self.out_dir.join(&src);
+//
+//         tracing::info!("written_path = {:?}", written_path);
+//
+//         // spawn a task to run prettier on this file so files can be formatted in parallel
+//         prettier_set.spawn(async move {
+//             tokio::process::Command::new("npx")
+//                 .arg("prettier")
+//                 .arg("--write")
+//                 .arg(&written_path)
+//                 .status()
+//                 .await
+//         });
+//
+//         fetched.push((src, bytes));
+//     }
+//
+//     // // join all prettier tasks so none are left running as orphans
+//     while let Some(task_result) = prettier_set.join_next().await {
+//         println!("task_result = {:?}", task_result);
+//         let _ = task_result?;
+//     }
+//
+//     Ok(fetched)
+// }

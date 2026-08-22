@@ -1,6 +1,7 @@
 use anyhow::Result;
 use scraper::{Html, Selector};
 use std::collections::HashSet;
+use tokio::sync::mpsc::Sender;
 
 pub struct Document {
     document: Html,
@@ -13,19 +14,23 @@ impl Document {
         Ok(Self { document })
     }
 
-    pub fn sources(&self) -> Vec<String> {
+    fn script_sources(&self) -> HashSet<String> {
         let script_selector = Selector::parse("script").unwrap();
 
         let scripts: Vec<_> = self.document.select(&script_selector).collect();
         tracing::info!("found {} <script src> sources in document", scripts.len());
 
-        let mut srcs: HashSet<_> = scripts
+        let srcs: HashSet<_> = scripts
             .iter()
             .map(|s| s.value().attr("src"))
             .filter(|s| s.is_some())
             .map(|s| s.unwrap().to_string())
             .collect();
 
+        srcs
+    }
+
+    fn link_sources(&self) -> HashSet<String> {
         let link_script_selector = Selector::parse("link[as='script']").unwrap();
 
         let link_scripts: Vec<_> = self.document.select(&link_script_selector).collect();
@@ -41,8 +46,15 @@ impl Document {
             .map(|s| s.unwrap().to_string())
             .collect();
 
-        srcs.extend(link_srcs);
+        link_srcs
+    }
 
-        srcs.into_iter().collect()
+    // TODO:
+    // these can be collected in one pass
+    pub fn sources(&self) -> Vec<String> {
+        let mut sources = self.script_sources();
+        sources.extend(self.link_sources());
+
+        sources.into_iter().collect()
     }
 }

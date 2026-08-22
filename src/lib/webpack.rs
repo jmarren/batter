@@ -135,6 +135,8 @@ pub fn extract_chunk_map(source: &str) -> Option<(ChunkMap, Option<String>)> {
     }
     // create a visitor
     let mut visitor = ChunkMapVisitor::new();
+
+    // use the visitor to visit the AST
     visitor.visit_program(&parsed.program);
 
     let chunk_map = visitor.chunk_map?;
