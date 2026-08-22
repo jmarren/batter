@@ -104,7 +104,6 @@ fn chunk_urls<'a>(arrow_fn: &oxc::allocator::Box<'a, ArrowFunctionExpression<'a>
     let Some(body) = arrow_body_expression(&arrow_fn) else {
         return;
     };
-    // println!("body = {:?}", body);
 
     let mut out = vec![];
     flatten_binary_plus_chain(body, &mut out);
@@ -127,6 +126,30 @@ fn chunk_urls<'a>(arrow_fn: &oxc::allocator::Box<'a, ArrowFunctionExpression<'a>
                 Expression::ConditionalExpression(c) => match &c.consequent {
                     Expression::StringLiteral(s) => {
                         println!("consequent = {:?}", s.raw);
+                    }
+                    _ => (),
+                },
+                _ => (),
+            },
+            Expression::Identifier(id) => {
+                println!("identifier = {:?}", id.name);
+            }
+            Expression::ComputedMemberExpression(m) => match &m.object {
+                Expression::ParenthesizedExpression(p) => match &p.expression {
+                    Expression::ObjectExpression(o) => {
+                        o.properties.iter().for_each(|prop| match &prop {
+                            ObjectPropertyKind::ObjectProperty(object_prop) => {
+                                match &object_prop.value {
+                                    Expression::StringLiteral(val) => {
+                                        if let Some(v) = val.raw {
+                                            println!("object_prop.value = {}", v);
+                                        }
+                                    }
+                                    _ => (),
+                                }
+                            }
+                            _ => (),
+                        });
                     }
                     _ => (),
                 },
