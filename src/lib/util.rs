@@ -47,3 +47,11 @@ pub fn ensure_suffix(src: String, suffix: String) -> String {
 pub fn ensure_js_ext(src: String) -> String {
     ensure_suffix(src, String::from(".js"))
 }
+
+// strips one layer of surrounding `"`/`'` from a string literal's raw source text
+pub fn strip_quotes(raw: &str) -> String {
+    raw.strip_prefix(['"', '\''])
+        .and_then(|s| s.strip_suffix(['"', '\'']))
+        .unwrap_or(raw)
+        .to_string()
+}
