@@ -55,3 +55,14 @@ pub fn strip_quotes(raw: &str) -> String {
         .unwrap_or(raw)
         .to_string()
 }
+
+// formats a js file in place with prettier; blocking, meant to be run on its own thread
+pub fn format_with_prettier(path: &PathBuf) -> Result<()> {
+    std::process::Command::new("npx")
+        .arg("prettier")
+        .arg("--write")
+        .arg(path)
+        .status()?;
+
+    Ok(())
+}

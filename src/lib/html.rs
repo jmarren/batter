@@ -1,7 +1,6 @@
 use anyhow::Result;
 use scraper::{Html, Selector};
 use std::collections::HashSet;
-use tokio::sync::mpsc::Sender;
 
 pub struct Document {
     document: Html,
