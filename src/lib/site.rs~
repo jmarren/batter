@@ -125,10 +125,10 @@ impl Site {
             .filter(|src| seen.insert(src.to_string()))
             .for_each(|src| {
                 tracing::info!("discovered {}", src);
-                join_set.spawn(fetch_js_source(src));
+
+                join_set.spawn(async move || return_bytes_and_src(src));
             });
 
-        // handle each response and log any errors that occur
         while let Some(task_result) = join_set.join_next().await {
             if let Err(e) = self
                 .handle_js_payload(&mut join_set, task_result, &mut seen)
@@ -150,8 +150,15 @@ impl Site {
         let chunk_urls = self.parse_chunk_urls(task_result).await?;
 
         for chunk_url in chunk_urls {
-            if seen.insert(chunk_url.to_string()) {
-                join_set.spawn(fetch_js_source(chunk_url));
+            if !seen.insert(chunk_url.to_string()) {
+                continue;
+            } else {
+                tracing::info!("discovered {}", chunk_url.to_string());
+
+                join_set.spawn(async move {
+                    let res = util::fetch_url(chunk_url.clone()).await;
+                    (res, chunk_url)
+                });
             }
         }
 
@@ -182,8 +189,7 @@ impl Site {
     }
 }
 
-// fetches the provided url and returns the url along with the response bytes
-async fn fetch_js_source(src: reqwest::Url) -> (Result<Vec<u8>>, reqwest::Url) {
+async fn return_bytes_and_src(src: reqwest::Url) -> (Result<Vec<u8>>, reqwest::Url) {
     let res = util::fetch_url(src.clone()).await;
     (res, src)
 }

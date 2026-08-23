@@ -17,11 +17,12 @@ use crate::util;
 
 pub struct JsSource {
     source_text: String,
+    url: reqwest::Url,
 }
 
 impl JsSource {
-    pub fn new(source_text: String) -> Self {
-        Self { source_text }
+    pub fn new(source_text: String, url: reqwest::Url) -> Self {
+        Self { source_text, url }
     }
 
     pub fn parse(&self) -> Result<HashSet<String>> {
@@ -40,7 +41,41 @@ impl JsSource {
 
         walker.visit_program(&parsed.program);
 
-        Ok(walker.chunk_urls)
+        Ok(walker
+            .chunk_urls
+            .iter()
+            .map(|raw| self.resolve_chunk_url(raw))
+            .collect())
+    }
+
+    // re-roots a bundler-relative chunk path (e.g. "static/chunks/558.hash.js")
+    // under whatever mount prefix this source file's own url implies - the
+    // chunk-loader code itself only ever contains a bundler-relative path, but
+    // the file we're currently parsing must itself be served from within the
+    // same mount as the chunks it loads, so we can recover the mount by finding
+    // where the chunk path's own leading segment shows up in this source's path.
+    // falls back to joining the raw path directly against this source's url if
+    // no matching segment is found.
+    fn resolve_chunk_url(&self, raw: &str) -> String {
+        let resolved = match raw.rfind('/') {
+            Some(slash_idx) => {
+                let leading_path = &raw[..=slash_idx];
+                let source_path = self.url.path();
+
+                match source_path.find(leading_path) {
+                    Some(mount_end) => self
+                        .url
+                        .join(&format!("{}{raw}", &source_path[..mount_end])),
+                    None => self.url.join(raw),
+                }
+            }
+            None => self.url.join(raw),
+        };
+
+        match resolved {
+            Ok(url) => url.to_string(),
+            Err(_) => raw.to_string(),
+        }
     }
 }
 
@@ -348,16 +383,21 @@ mod tests {
               ".js");
         "#;
 
-        let urls = JsSource::new(source.to_string()).parse().unwrap();
+        let source_url =
+            reqwest::Url::parse("https://example.com/_next/static/chunks/webpack-abc.js").unwrap();
+
+        let urls = JsSource::new(source.to_string(), source_url)
+            .parse()
+            .unwrap();
 
         assert_eq!(
             urls,
             HashSet::from([
-                "static/chunks/558.097941ffb76484a3.js".to_string(),
-                "static/chunks/4327.115b4e4cf5dfd289.js".to_string(),
-                "static/chunks/c07e5374.744537bcd0ee57b6.js".to_string(),
-                "static/chunks/6497.746d29151a1f862f.js".to_string(),
-                "static/chunks/6684.dcd4d65d61c9e94e.js".to_string(),
+                "https://example.com/_next/static/chunks/558.097941ffb76484a3.js".to_string(),
+                "https://example.com/_next/static/chunks/4327.115b4e4cf5dfd289.js".to_string(),
+                "https://example.com/_next/static/chunks/c07e5374.744537bcd0ee57b6.js".to_string(),
+                "https://example.com/_next/static/chunks/6497.746d29151a1f862f.js".to_string(),
+                "https://example.com/_next/static/chunks/6684.dcd4d65d61c9e94e.js".to_string(),
             ])
         );
     }
@@ -463,18 +503,25 @@ mod tests {
                   ".js");
         "#;
 
-        let urls = JsSource::new(source.to_string()).parse().unwrap();
+        let source_url =
+            reqwest::Url::parse("https://example.com/_next/static/chunks/webpack-abc.js").unwrap();
+
+        let urls = JsSource::new(source.to_string(), source_url)
+            .parse()
+            .unwrap();
 
         // the hardcoded literal-path override for chunk 6918
-        assert!(urls.contains("static/chunks/6918-9e9acda1c00665ed.js"));
+        assert!(urls.contains("https://example.com/_next/static/chunks/6918-9e9acda1c00665ed.js"));
 
         // an ordinary entry straight from the id -> hash map
-        assert!(urls.contains("static/chunks/2.c1a2846f3c3641f7.js"));
+        assert!(urls.contains("https://example.com/_next/static/chunks/2.c1a2846f3c3641f7.js"));
 
         // the id whose filename fragment gets substituted (3829 -> "a2997d9c")
         // while its hash still comes from the map
-        assert!(urls.contains("static/chunks/a2997d9c.47f6e0543e8417ab.js"));
-        assert!(!urls.contains("static/chunks/3829.47f6e0543e8417ab.js"));
+        assert!(
+            urls.contains("https://example.com/_next/static/chunks/a2997d9c.47f6e0543e8417ab.js")
+        );
+        assert!(!urls.contains("https://example.com/_next/static/chunks/3829.47f6e0543e8417ab.js"));
 
         // 87 entries in the map, plus the 6918 literal override url (which
         // never appears in the map itself)
@@ -498,15 +545,53 @@ mod tests {
             ]);
         "#;
 
-        let urls = JsSource::new(source.to_string()).parse().unwrap();
+        // no path segment shared with the chunk urls below, so resolution
+        // falls back to a plain join against this source's url
+        let source_url = reqwest::Url::parse("https://example.com/entry.js").unwrap();
+
+        let urls = JsSource::new(source.to_string(), source_url)
+            .parse()
+            .unwrap();
 
         assert_eq!(
             urls,
             HashSet::from([
-                "static/immutable/chunks/236-04af9ww4u.js".to_string(),
-                "static/immutable/chunks/0ifbgewhks2yb.js".to_string(),
-                "static/immutable/chunks/2ko36sx9hycil.js".to_string(),
-                "static/immutable/chunks/2tt92x9jwpwmi.js".to_string(),
+                "https://example.com/static/immutable/chunks/236-04af9ww4u.js".to_string(),
+                "https://example.com/static/immutable/chunks/0ifbgewhks2yb.js".to_string(),
+                "https://example.com/static/immutable/chunks/2ko36sx9hycil.js".to_string(),
+                "https://example.com/static/immutable/chunks/2tt92x9jwpwmi.js".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn reroots_chunk_urls_under_detected_mount() {
+        let source = r#"
+            (c.u = (e) =>
+              "static/chunks/" +
+              e +
+              "." +
+              {
+                558: "097941ffb76484a3",
+              }[e] +
+              ".js");
+        "#;
+
+        // source served from under a mount other than the site root - the
+        // resolved chunk url should land under that same mount, not the root
+        let source_url =
+            reqwest::Url::parse("https://example.com/_app/immutable/static/chunks/entry.js")
+                .unwrap();
+
+        let urls = JsSource::new(source.to_string(), source_url)
+            .parse()
+            .unwrap();
+
+        assert_eq!(
+            urls,
+            HashSet::from([
+                "https://example.com/_app/immutable/static/chunks/558.097941ffb76484a3.js"
+                    .to_string(),
             ])
         );
     }

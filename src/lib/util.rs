@@ -15,7 +15,7 @@ pub fn full_path(path: PathBuf) -> Result<PathBuf> {
     Ok(std::fs::canonicalize(out_dir)?)
 }
 
-pub async fn fetch_url(url: &reqwest::Url) -> Result<Vec<u8>> {
+pub async fn fetch_url(url: reqwest::Url) -> Result<Vec<u8>> {
     let response = reqwest::get(url).await?.error_for_status()?;
 
     // reqwest::get
