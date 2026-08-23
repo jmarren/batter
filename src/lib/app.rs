@@ -10,6 +10,7 @@ mod js;
 mod site;
 mod util;
 mod webpack;
+mod writer;
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -31,10 +32,22 @@ impl App {
     fn from_cli(cli: Cli) -> Result<Self> {
         let out_dir = util::full_path(cli.out_dir)?;
 
-        let site = Site::new(out_dir, cli.domain.clone(), cli.allow_external_sources);
+        // let opt = reqwest::Url::options().base_url(&url);
+
+        // client.get(url.to_string()).send();
+
+        let site_writer = writer::Writer::new(out_dir.join(&cli.domain));
+
+        let url = reqwest::Url::parse(&format!("https://{}", &cli.domain))?;
+        // let opt = reqwest::Url::options().base_url(Some(&url));
+
+        let mut site = Site::new(site_writer, url);
+
+        if cli.allow_external_sources {
+            site = site.allow_external_sources();
+        }
 
         Ok(Self {
-            // out_dir,
             domain: cli.domain,
             site,
         })

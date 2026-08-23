@@ -1,7 +1,5 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Mutex;
-use std::thread::JoinHandle;
 
 use anyhow::{Result, anyhow};
 use tokio::task::{JoinError, JoinSet};
@@ -9,52 +7,40 @@ use tokio::task::{JoinError, JoinSet};
 use crate::{
     html,
     js::JsSource,
-    util::{self, ensure_js_ext},
+    util::{self},
+    writer::Writer,
 };
 
 pub struct Site {
-    domain: String,
-    out_dir: PathBuf,
+    url: reqwest::Url,
+    // domain: String,
+    // out_dir: PathBuf,
     allow_external_sources: bool,
     // document: Option<html::Document>,
-    prettier_handles: Mutex<Vec<JoinHandle<()>>>,
+    // prettier_handles: Mutex<Vec<JoinHandle<()>>>,
     all_sources: Mutex<Vec<String>>,
+    writer: Writer,
+
+    client: reqwest::Client,
 }
 
 impl Site {
-    pub fn new(out_dir: PathBuf, domain: String, allow_external_sources: bool) -> Self {
+    pub fn new(writer: Writer, url: reqwest::Url) -> Self {
         Self {
-            domain,
-            out_dir,
-            allow_external_sources,
-            prettier_handles: Mutex::new(vec![]),
+            url,
+            // url: reqwest::Url::parse(format!(")
+            // domain,
+            writer,
+            client: reqwest::Client::new(),
+            allow_external_sources: false,
             all_sources: Mutex::new(vec![]),
         }
     }
 
-    // resolves `src` against the site's domain, records it in `all_sources`
-    // regardless of the outcome, and returns the fetchable url unless it's
-    // cross-origin and external sources aren't allowed
-    fn resolve_source(&self, src: &str) -> Option<String> {
-        let (host, path) = match util::resolve_source_url(&self.domain, src) {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                tracing::error!("failed to resolve source url {src}: {err:#}");
-                return None;
-            }
-        };
-
-        let full_url = format!("{host}{path}");
-        self.all_sources.lock().unwrap().push(full_url.clone());
-
-        if host != self.domain && !self.allow_external_sources {
-            tracing::info!("discarding cross-origin source: {full_url}");
-            return None;
-        }
-
-        Some(full_url)
+    pub fn allow_external_sources(mut self) -> Self {
+        self.allow_external_sources = true;
+        self
     }
-
     // write every source url discovered during the crawl to js-sources.txt
     async fn write_all_sources(&self) -> Result<()> {
         let sources = self.all_sources.lock().unwrap().clone();
@@ -63,26 +49,22 @@ impl Site {
             .map(|src| format!("https://{src}\n"))
             .collect();
 
-        self.write_file(contents.as_bytes(), "js-sources.txt")
+        self.writer
+            .write("js-sources.txt", contents.as_bytes())
             .await
-    }
-
-    // wait for every spawned prettier thread to finish
-    fn join_prettier_handles(&self) {
-        let handles = std::mem::take(&mut *self.prettier_handles.lock().unwrap());
-
-        for handle in handles {
-            let _ = handle.join();
-        }
     }
 
     // fetch html from domain, write it to file, and return document struct
     async fn fetch_html(&mut self) -> Result<html::Document> {
-        // fetch the site and send data to sender to write
-        let res = util::fetch_url(&self.domain).await?;
+        let res = self
+            .client
+            .get(self.url.join("")?)
+            .send()
+            .await?
+            .bytes()
+            .await?;
 
-        // write index to file
-        self.write_index(&res).await?;
+        self.writer.write("index.html", &res).await?;
 
         // create document
         Ok(html::Document::new(&res)?)
@@ -93,46 +75,68 @@ impl Site {
         // fetch html
         let doc = self.fetch_html().await?;
 
-        // get sources
-        let sources = doc.sources();
+        let mut source_strs = vec![];
+
+        // get sources and join with self.url
+        let all_sources: Vec<reqwest::Url> = doc
+            .sources()
+            .iter()
+            // join with base url.
+            .filter_map(|src| match self.url.join(src) {
+                Ok(x) => {
+                    source_strs.push(x.to_string());
+                    Some(x)
+                }
+                // filter out and report if failed
+                Err(e) => {
+                    tracing::error!("{:?}", e);
+                    None
+                }
+            })
+            .collect();
+
+        // filter out cross origin if we are not allowing them
+        let sources = {
+            if self.allow_external_sources {
+                all_sources
+            } else {
+                all_sources
+                    .into_iter()
+                    .filter(|src| src.domain() == self.url.domain())
+                    .collect()
+            }
+        };
 
         // handle sources
         self.handle_sources(&sources).await?;
 
-        // wait for all formatting to finish before returning
-        self.join_prettier_handles();
-
         // write every discovered source url to js-sources.txt
-        self.write_all_sources().await?;
+        // self.write_all_sources().await?;
 
         Ok(())
     }
 
     // handle source urls returned from document
-    async fn handle_sources(&self, sources: &[String]) -> Result<()> {
+    async fn handle_sources(&self, sources: &[reqwest::Url]) -> Result<()> {
         let mut join_set = JoinSet::new();
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<reqwest::Url> = HashSet::new();
 
-        // spawn a task to fetch each source found
-        for source in sources {
-            let Some(src) = self.resolve_source(source) else {
-                continue;
-            };
-
-            if !seen.insert(src.clone()) {
-                continue;
+        sources.into_iter().for_each(|src| {
+            if !seen.insert(*src) {
+                return;
             }
 
-            tracing::info!("discovered {}", src);
+            tracing::info!("{}", src);
 
             join_set.spawn(async move {
-                let res = util::fetch_url(&src).await;
+                let res = util::fetch_url(src).await;
                 (res, src)
             });
-        }
+        });
 
         while let Some(task_result) = join_set.join_next().await {
-            let chunk_urls = match self.handle_source_response(task_result).await {
+            // parse chunk_urls from the source
+            let chunk_urls = match self.parse_chunk_urls(task_result).await {
                 Ok(chunk_urls) => chunk_urls,
                 Err(err) => {
                     // ignore errors so we don't stop prematurely, but report them
@@ -167,18 +171,15 @@ impl Site {
     // - write to file
     // - parse
     // - return any chunk urls discovered while parsing
-    async fn handle_source_response(
+    async fn parse_chunk_urls(
         &self,
-        task_result: Result<(Result<Vec<u8>>, String), JoinError>,
+        task_result: Result<(Result<Vec<u8>>, &reqwest::Url), JoinError>,
     ) -> Result<HashSet<String>> {
         let (res, src) = task_result.map_err(|err| anyhow!("fetch task panicked: {err}"))?;
         let bytes = res.map_err(|err| anyhow!("failed to fetch {src}: {err}"))?;
 
-        // ensure source has `.js` file extension
-        let file_path = ensure_js_ext(src);
-
         // write the data to the source path
-        self.write_file(&bytes, &file_path).await?;
+        self.writer.write_js(src.to_string(), &bytes).await?;
 
         // create new JsSource object from data
         let js_source = JsSource::new(String::from_utf8(bytes)?);
@@ -186,30 +187,49 @@ impl Site {
         // parse the source and return any chunk urls found
         js_source.parse()
     }
-
-    async fn write_index(&self, data: &[u8]) -> Result<()> {
-        self.write_file(data, "index.html").await?;
-        Ok(())
-    }
-
-    async fn write_file(&self, data: &[u8], path: &str) -> Result<()> {
-        let full_path = self
-            .out_dir
-            .join(PathBuf::from(&self.domain))
-            .join(PathBuf::from(path));
-
-        util::write_file(full_path.clone(), data).await?;
-
-        if full_path.extension().is_some_and(|ext| ext == "js") {
-            let handle = std::thread::spawn(move || {
-                if let Err(err) = util::format_with_prettier(&full_path) {
-                    tracing::warn!("failed to format {:?}: {}", full_path, err);
-                }
-            });
-
-            self.prettier_handles.lock().unwrap().push(handle);
-        }
-
-        Ok(())
-    }
 }
+
+// spawn a task to fetch each source found
+// for source in sources {
+//     let Some(src) = self.resolve_source(source) else {
+//         continue;
+//     };
+//
+//     if !seen.insert(src.clone()) {
+//         continue;
+//     }
+//
+//     tracing::info!("discovered {}", src);
+//
+//     join_set.spawn(async move {
+//         let res = util::fetch_url(&src).await;
+//         (res, src)
+//     });
+// }
+//
+//
+//
+// // resolves `src` against the site's domain, records it in `all_sources`
+// // regardless of the outcome, and returns the fetchable url unless it's
+// // cross-origin and external sources aren't allowed
+// fn resolve_source(&self, src: &str) -> Option<String> {
+//     // let (host, path) = match util::resolve_source_url(&self.domain, src) {
+//     //     Ok(resolved) => resolved,
+//     //     Err(err) => {
+//     //         tracing::error!("failed to resolve source url {src}: {err:#}");
+//     //         return None;
+//     //     }
+//     // };
+//
+//     let full_url = format!("{host}{path}");
+//     self.all_sources.lock().unwrap().push(full_url.clone());
+//
+//     tracing::debug!("resolved {} to {}", src, full_url);
+//
+//     if host != self.domain && !self.allow_external_sources {
+//         tracing::info!("discarding cross-origin source: {full_url}");
+//         return None;
+//     }
+//
+//     Some(full_url)
+// }

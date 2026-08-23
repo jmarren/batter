@@ -1,4 +1,5 @@
 use anyhow::Result;
+use reqwest::IntoUrl;
 use std::env;
 // use std::io;
 use std::path::PathBuf;
@@ -14,10 +15,10 @@ pub fn full_path(path: PathBuf) -> Result<PathBuf> {
     Ok(std::fs::canonicalize(out_dir)?)
 }
 
-pub async fn fetch_url(url: &str) -> Result<Vec<u8>> {
-    let response = reqwest::get(format!("https://{}", url))
-        .await?
-        .error_for_status()?;
+pub async fn fetch_url(url: &reqwest::Url) -> Result<Vec<u8>> {
+    let response = reqwest::get(url).await?.error_for_status()?;
+
+    // reqwest::get
     let bytes = response.bytes().await?;
 
     Ok(bytes.to_vec())
@@ -34,18 +35,6 @@ pub async fn write_file(full_path: PathBuf, data: &[u8]) -> Result<()> {
     tokio::fs::write(full_path, data).await?;
 
     Ok(())
-}
-
-pub fn ensure_suffix(src: String, suffix: String) -> String {
-    if src.ends_with(&suffix) {
-        src
-    } else {
-        format!("{src}{suffix}")
-    }
-}
-
-pub fn ensure_js_ext(src: String) -> String {
-    ensure_suffix(src, String::from(".js"))
 }
 
 // strips one layer of surrounding `"`/`'` from a string literal's raw source text
@@ -73,6 +62,7 @@ pub fn format_with_prettier(path: &PathBuf) -> Result<()> {
 // to keep it based on whether the host matches the domain being crawled
 pub fn resolve_source_url(domain: &str, src: &str) -> Result<(String, String)> {
     let base = reqwest::Url::parse(&format!("https://{domain}"))?;
+
     let resolved = base.join(src)?;
 
     let host = resolved.host_str().unwrap_or(domain).to_string();
@@ -112,16 +102,14 @@ mod tests {
 
     #[test]
     fn resolves_protocol_relative_different_host() {
-        let (host, path) =
-            resolve_source_url("example.com", "//cdn.example.com/foo.js").unwrap();
+        let (host, path) = resolve_source_url("example.com", "//cdn.example.com/foo.js").unwrap();
         assert_eq!(host, "cdn.example.com");
         assert_eq!(path, "/foo.js");
     }
 
     #[test]
     fn resolves_absolute_same_host() {
-        let (host, path) =
-            resolve_source_url("example.com", "https://example.com/foo.js").unwrap();
+        let (host, path) = resolve_source_url("example.com", "https://example.com/foo.js").unwrap();
         assert_eq!(host, "example.com");
         assert_eq!(path, "/foo.js");
     }
@@ -136,8 +124,7 @@ mod tests {
 
     #[test]
     fn preserves_query_string() {
-        let (host, path) =
-            resolve_source_url("example.com", "/foo.js?v=123").unwrap();
+        let (host, path) = resolve_source_url("example.com", "/foo.js?v=123").unwrap();
         assert_eq!(host, "example.com");
         assert_eq!(path, "/foo.js?v=123");
     }
