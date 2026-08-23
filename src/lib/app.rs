@@ -33,15 +33,9 @@ impl App {
     fn from_cli(cli: Cli) -> Result<Self> {
         let out_dir = util::full_path(cli.out_dir)?;
 
-        // let opt = reqwest::Url::options().base_url(&url);
-
-        // client.get(url.to_string()).send();
-
-        let site_writer =
-            writer::Writer::new(out_dir.join(&cli.domain), Duration::from_secs(10));
+        let site_writer = writer::Writer::new(out_dir.join(&cli.domain), Duration::from_secs(10));
 
         let url = reqwest::Url::parse(&format!("https://{}", &cli.domain))?;
-        // let opt = reqwest::Url::options().base_url(Some(&url));
 
         let mut site = Site::new(site_writer, url);
 

@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -20,9 +19,8 @@ enum Task {
 
 pub struct Writer {
     base_path: PathBuf,
-    // taken (replaced with None) by join() to signal the consumer to shut down
     tx: mpsc::UnboundedSender<Task>,
-    // the background consumer task; awaited (and taken) in join()
+    // the background consumer task; awaited by join(), which consumes self
     consumer: JoinHandle<()>,
 }
 
@@ -33,8 +31,8 @@ impl Writer {
 
         Self {
             base_path: base_path.into(),
-            tx: tx,
-            consumer: consumer,
+            tx,
+            consumer,
         }
     }
 
@@ -47,10 +45,6 @@ impl Writer {
         };
 
         self.tx
-            // .lock()
-            // .unwrap()
-            // .as_ref()
-            // .ok_or_else(|| anyhow!("writer already joined"))?
             .send(Task::Write(job))
             .map_err(|_| anyhow!("writer's background task is no longer running"))
     }
@@ -77,28 +71,18 @@ impl Writer {
 
     // signals the background writer to stop accepting new jobs and waits for it
     // to finish (or hit its deadline, at which point remaining writes are
-    // aborted and logged) - safe to call more than once
+    // aborted and logged). consumes self, so no further writes can be queued
+    // after calling this.
     pub async fn join(self) {
-        self.tx.send(Task::Shutdown);
-        self.consumer.await.unwrap();
+        // only fails if the consumer task has already exited (e.g. panicked),
+        // in which case there's nothing left to wait for
+        if self.tx.send(Task::Shutdown).is_err() {
+            return;
+        }
 
-        // self.tx.
-        // self.tx.send(None);
-
-        // self.consumer.abort_handle
-
-        // self.consumer.abort();
-        // dropping the sender closes the channel from this side, causing the
-        // // consumer's rx.recv() to return None and begin shutting down
-        // self.tx.lock().unwrap().take();
-        //
-        // let handle = self.consumer.lock().unwrap().take();
-        //
-        // if let Some(handle) = handle
-        //     && let Err(err) = handle.await
-        // {
-        //     tracing::error!("writer background task panicked: {err}");
-        // }
+        if let Err(err) = self.consumer.await {
+            tracing::error!("writer background task panicked: {err}");
+        }
     }
 }
 
@@ -154,81 +138,54 @@ fn log_write_result(result: std::result::Result<Result<()>, tokio::task::JoinErr
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//
-//     fn scratch_dir(name: &str) -> PathBuf {
-//         let dir = std::env::temp_dir().join(format!("batter-writer-test-{name}"));
-//         let _ = std::fs::remove_dir_all(&dir);
-//         dir
-//     }
-//
-//     #[tokio::test]
-//     async fn writes_are_flushed_to_disk_by_join() {
-//         let dir = scratch_dir("flush");
-//         let writer = Writer::new(&dir, Duration::from_secs(5));
-//
-//         writer.write("a.txt", b"hello").await.unwrap();
-//         writer.write("nested/b.txt", b"world").await.unwrap();
-//
-//         writer.join().await;
-//
-//         assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"hello");
-//         assert_eq!(std::fs::read(dir.join("nested/b.txt")).unwrap(), b"world");
-//
-//         std::fs::remove_dir_all(&dir).unwrap();
-//     }
-//
-//     #[tokio::test]
-//     async fn join_is_safe_to_call_more_than_once() {
-//         let dir = scratch_dir("double-join");
-//         let writer = Writer::new(&dir, Duration::from_secs(5));
-//
-//         writer.write("a.txt", b"hello").await.unwrap();
-//
-//         writer.join().await;
-//         writer.join().await;
-//
-//         assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"hello");
-//
-//         std::fs::remove_dir_all(&dir).unwrap();
-//     }
-//
-//     #[tokio::test]
-//     async fn write_after_join_returns_an_error() {
-//         let dir = scratch_dir("write-after-join");
-//         let writer = Writer::new(&dir, Duration::from_secs(5));
-//
-//         writer.join().await;
-//
-//         assert!(writer.write("a.txt", b"hello").await.is_err());
-//
-//         let _ = std::fs::remove_dir_all(&dir);
-//     }
-//
-//     #[tokio::test]
-//     async fn join_returns_promptly_with_a_short_deadline() {
-//         let dir = scratch_dir("deadline");
-//         let writer = Writer::new(&dir, Duration::from_millis(50));
-//
-//         // queue a large number of writes so at least some are still pending
-//         // when join() is called
-//         for i in 0..500 {
-//             writer.write(format!("{i}.txt"), b"hello").await.unwrap();
-//         }
-//
-//         let started = std::time::Instant::now();
-//         writer.join().await;
-//         let elapsed = started.elapsed();
-//
-//         // regardless of how many writes finished in time, join() itself must
-//         // never block past roughly its configured deadline
-//         assert!(
-//             elapsed < Duration::from_secs(2),
-//             "join() took too long: {elapsed:?}"
-//         );
-//
-//         let _ = std::fs::remove_dir_all(&dir);
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("batter-writer-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[tokio::test]
+    async fn writes_are_flushed_to_disk_by_join() {
+        let dir = scratch_dir("flush");
+        let writer = Writer::new(&dir, Duration::from_secs(5));
+
+        writer.write("a.txt", b"hello").unwrap();
+        writer.write("nested/b.txt", b"world").unwrap();
+
+        writer.join().await;
+
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"hello");
+        assert_eq!(std::fs::read(dir.join("nested/b.txt")).unwrap(), b"world");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn join_returns_promptly_with_a_short_deadline() {
+        let dir = scratch_dir("deadline");
+        let writer = Writer::new(&dir, Duration::from_millis(50));
+
+        // queue a large number of writes so at least some are still pending
+        // when join() is called
+        for i in 0..500 {
+            writer.write(format!("{i}.txt"), b"hello").unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        writer.join().await;
+        let elapsed = started.elapsed();
+
+        // regardless of how many writes finished in time, join() itself must
+        // never block past roughly its configured deadline
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "join() took too long: {elapsed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
