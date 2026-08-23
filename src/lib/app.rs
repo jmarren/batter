@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use std::fmt::Debug;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::site::Site;
 
@@ -36,7 +37,8 @@ impl App {
 
         // client.get(url.to_string()).send();
 
-        let site_writer = writer::Writer::new(out_dir.join(&cli.domain));
+        let site_writer =
+            writer::Writer::new(out_dir.join(&cli.domain), Duration::from_secs(10));
 
         let url = reqwest::Url::parse(&format!("https://{}", &cli.domain))?;
         // let opt = reqwest::Url::options().base_url(Some(&url));

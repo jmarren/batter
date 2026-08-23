@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::sync::Mutex;
 
 use anyhow::{Result, anyhow};
 use tokio::task::{JoinError, JoinSet};
@@ -43,7 +42,7 @@ impl Site {
             .bytes()
             .await?;
 
-        self.writer.write("index.html", &res).await?;
+        self.writer.write("index.html", &res)?;
 
         // create document
         Ok(html::Document::new(&res)?)
@@ -96,6 +95,9 @@ impl Site {
 
         // handle sources
         self.handle_sources(sources).await?;
+
+        // wait for all background writes to finish (bounded by the writer's deadline)
+        self.writer.join().await;
 
         Ok(())
     }
@@ -156,7 +158,7 @@ impl Site {
         let bytes = res.map_err(|err| anyhow!("failed to fetch {src_url}: {err}"))?;
 
         // write the data to the source path
-        self.writer.write_js(src_url.to_string(), &bytes).await?;
+        self.writer.write_js(src_url.to_string(), &bytes);
 
         // create new JsSource object from data
         let js_source = JsSource::new(String::from_utf8(bytes)?, src_url.clone());
