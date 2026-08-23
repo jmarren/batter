@@ -13,9 +13,7 @@ use crate::{
 pub struct Site {
     url: reqwest::Url,
     allow_external_sources: bool,
-    // taken by enumerate() at the end of the crawl so the writer can be
-    // consumed by Writer::join()
-    writer: Option<Writer>,
+    writer: Writer,
     client: reqwest::Client,
 }
 
@@ -23,18 +21,10 @@ impl Site {
     pub fn new(writer: Writer, url: reqwest::Url) -> Self {
         Self {
             url,
-            writer: Some(writer),
+            writer,
             client: reqwest::Client::new(),
             allow_external_sources: false,
         }
-    }
-
-    // the writer is always present except in the brief window after
-    // enumerate() has taken it to call join() - never called after that point
-    fn writer(&self) -> &Writer {
-        self.writer
-            .as_ref()
-            .expect("writer used after being joined")
     }
 
     pub fn allow_external_sources(mut self) -> Self {
@@ -52,7 +42,7 @@ impl Site {
             .bytes()
             .await?;
 
-        self.writer().write("index.html", &res)?;
+        self.writer.write("index.html", &res)?;
 
         // create document
         Ok(html::Document::new(&res)?)
@@ -107,9 +97,7 @@ impl Site {
         self.handle_sources(sources).await?;
 
         // wait for all background writes to finish (bounded by the writer's deadline)
-        if let Some(writer) = self.writer.take() {
-            writer.join().await;
-        }
+        self.writer.join().await;
 
         Ok(())
     }
@@ -170,7 +158,7 @@ impl Site {
         let bytes = res.map_err(|err| anyhow!("failed to fetch {src_url}: {err}"))?;
 
         // write the data to the source path
-        self.writer().write_js(src_url.to_string(), &bytes)?;
+        self.writer.write_js(src_url.to_string(), &bytes)?;
 
         // create new JsSource object from data
         let js_source = JsSource::new(String::from_utf8(bytes)?, src_url.clone());

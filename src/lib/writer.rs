@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -20,8 +21,11 @@ enum Task {
 pub struct Writer {
     base_path: PathBuf,
     tx: mpsc::UnboundedSender<Task>,
-    // the background consumer task; awaited by join(), which consumes self
-    consumer: JoinHandle<()>,
+    // the background consumer task; taken and awaited by join(). wrapped so
+    // join() can work from &self - only ever accessed by whichever call to
+    // join() gets there first, since every other write()/join() caller only
+    // ever needs the sender.
+    consumer: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Writer {
@@ -32,7 +36,7 @@ impl Writer {
         Self {
             base_path: base_path.into(),
             tx,
-            consumer,
+            consumer: Mutex::new(Some(consumer)),
         }
     }
 
@@ -69,18 +73,25 @@ impl Writer {
         self.write(path, data)
     }
 
-    // signals the background writer to stop accepting new jobs and waits for it
-    // to finish (or hit its deadline, at which point remaining writes are
-    // aborted and logged). consumes self, so no further writes can be queued
-    // after calling this.
-    pub async fn join(self) {
-        // only fails if the consumer task has already exited (e.g. panicked),
-        // in which case there's nothing left to wait for
-        if self.tx.send(Task::Shutdown).is_err() {
-            return;
-        }
+    // signals the background writer to stop accepting new jobs and waits for
+    // it to finish (or hit its deadline, at which point remaining writes are
+    // aborted and logged). safe to call more than once - only the first
+    // caller actually awaits the consumer; any write() attempted after this
+    // simply gets a "no longer running" error back, since the channel send
+    // fails once the consumer has read the Shutdown task and exited.
+    pub async fn join(&self) {
+        // only fails if the consumer has already exited (e.g. panicked, or a
+        // previous join() already ran), in which case there's nothing left
+        // to signal
+        let _ = self.tx.send(Task::Shutdown);
 
-        if let Err(err) = self.consumer.await {
+        // take() ensures only the first caller actually awaits the handle;
+        // later callers see None and return immediately
+        let handle = self.consumer.lock().unwrap().take();
+
+        if let Some(handle) = handle
+            && let Err(err) = handle.await
+        {
             tracing::error!("writer background task panicked: {err}");
         }
     }
@@ -162,6 +173,33 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("nested/b.txt")).unwrap(), b"world");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn join_is_safe_to_call_more_than_once() {
+        let dir = scratch_dir("double-join");
+        let writer = Writer::new(&dir, Duration::from_secs(5));
+
+        writer.write("a.txt", b"hello").unwrap();
+
+        writer.join().await;
+        writer.join().await;
+
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"hello");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_after_join_returns_an_error() {
+        let dir = scratch_dir("write-after-join");
+        let writer = Writer::new(&dir, Duration::from_secs(5));
+
+        writer.join().await;
+
+        assert!(writer.write("a.txt", b"hello").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
