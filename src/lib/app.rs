@@ -16,6 +16,10 @@ struct Cli {
     domain: String,
     #[arg(default_value = ".")]
     out_dir: PathBuf,
+    // by default, sources not on the site's domain are discarded; pass this to
+    // fetch them anyway
+    #[arg(long)]
+    allow_external_sources: bool,
 }
 
 struct App {
@@ -27,7 +31,7 @@ impl App {
     fn from_cli(cli: Cli) -> Result<Self> {
         let out_dir = util::full_path(cli.out_dir)?;
 
-        let site = Site::new(out_dir, cli.domain.clone());
+        let site = Site::new(out_dir, cli.domain.clone(), cli.allow_external_sources);
 
         Ok(Self {
             // out_dir,
@@ -44,7 +48,7 @@ impl App {
 }
 
 #[tokio::main]
-pub async fn run() {
+pub async fn start() {
     // parse .env
     dotenvy::dotenv().ok();
 

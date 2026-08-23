@@ -1,5 +1,5 @@
-use batter::run;
+use batter::start;
 
 fn main() {
-    run();
+    start();
 }

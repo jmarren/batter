@@ -15,17 +15,56 @@ use crate::{
 pub struct Site {
     domain: String,
     out_dir: PathBuf,
+    allow_external_sources: bool,
     // document: Option<html::Document>,
     prettier_handles: Mutex<Vec<JoinHandle<()>>>,
+    all_sources: Mutex<Vec<String>>,
 }
 
 impl Site {
-    pub fn new(out_dir: PathBuf, domain: String) -> Self {
+    pub fn new(out_dir: PathBuf, domain: String, allow_external_sources: bool) -> Self {
         Self {
             domain,
             out_dir,
+            allow_external_sources,
             prettier_handles: Mutex::new(vec![]),
+            all_sources: Mutex::new(vec![]),
         }
+    }
+
+    // resolves `src` against the site's domain, records it in `all_sources`
+    // regardless of the outcome, and returns the fetchable url unless it's
+    // cross-origin and external sources aren't allowed
+    fn resolve_source(&self, src: &str) -> Option<String> {
+        let (host, path) = match util::resolve_source_url(&self.domain, src) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                tracing::error!("failed to resolve source url {src}: {err:#}");
+                return None;
+            }
+        };
+
+        let full_url = format!("{host}{path}");
+        self.all_sources.lock().unwrap().push(full_url.clone());
+
+        if host != self.domain && !self.allow_external_sources {
+            tracing::info!("discarding cross-origin source: {full_url}");
+            return None;
+        }
+
+        Some(full_url)
+    }
+
+    // write every source url discovered during the crawl to js-sources.txt
+    async fn write_all_sources(&self) -> Result<()> {
+        let sources = self.all_sources.lock().unwrap().clone();
+        let contents: String = sources
+            .iter()
+            .map(|src| format!("https://{src}\n"))
+            .collect();
+
+        self.write_file(contents.as_bytes(), "js-sources.txt")
+            .await
     }
 
     // wait for every spawned prettier thread to finish
@@ -63,6 +102,9 @@ impl Site {
         // wait for all formatting to finish before returning
         self.join_prettier_handles();
 
+        // write every discovered source url to js-sources.txt
+        self.write_all_sources().await?;
+
         Ok(())
     }
 
@@ -72,9 +114,14 @@ impl Site {
         let mut seen: HashSet<String> = HashSet::new();
 
         // spawn a task to fetch each source found
-        for i in 0..sources.len() {
-            let src = format!("{}{}", self.domain, sources[i]);
-            seen.insert(src.clone());
+        for source in sources {
+            let Some(src) = self.resolve_source(source) else {
+                continue;
+            };
+
+            if !seen.insert(src.clone()) {
+                continue;
+            }
 
             tracing::info!("discovered {}", src);
 
@@ -96,7 +143,9 @@ impl Site {
 
             // spawn a task for any newly discovered chunk we haven't already seen
             for chunk_url in chunk_urls {
-                let src = format!("{}/_next/{}", self.domain, chunk_url);
+                let Some(src) = self.resolve_source(&format!("_next/{chunk_url}")) else {
+                    continue;
+                };
 
                 if !seen.insert(src.clone()) {
                     continue;
