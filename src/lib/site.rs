@@ -14,7 +14,6 @@ use crate::{
 pub struct Site {
     url: reqwest::Url,
     allow_external_sources: bool,
-    all_sources: Mutex<Vec<String>>,
     writer: Writer,
     client: reqwest::Client,
 }
@@ -26,25 +25,12 @@ impl Site {
             writer,
             client: reqwest::Client::new(),
             allow_external_sources: false,
-            all_sources: Mutex::new(vec![]),
         }
     }
 
     pub fn allow_external_sources(mut self) -> Self {
         self.allow_external_sources = true;
         self
-    }
-    // write every source url discovered during the crawl to js-sources.txt
-    async fn write_all_sources(&self) -> Result<()> {
-        let sources = self.all_sources.lock().unwrap().clone();
-        let contents: String = sources
-            .iter()
-            .map(|src| format!("https://{src}\n"))
-            .collect();
-
-        self.writer
-            .write("js-sources.txt", contents.as_bytes())
-            .await
     }
 
     // fetch html from domain, write it to file, and return document struct

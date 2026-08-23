@@ -1,17 +1,20 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use tokio::task::JoinSet;
 
 use crate::util;
 
 pub struct Writer {
     base_path: PathBuf,
+    join_set: JoinSet<()>,
 }
 
 impl Writer {
     pub fn new(base_path: impl Into<PathBuf>) -> Self {
         Self {
             base_path: base_path.into(),
+            join_set: JoinSet::new(),
         }
     }
 
@@ -39,6 +42,10 @@ impl Writer {
         path.set_extension(ext);
         // write
         self.write(path, data).await
+    }
+
+    pub async fn join(&self) {
+        // self.join_set.join_all().await;
     }
 
     // async fn write_file(&self, data: &[u8], path: &str) -> Result<()> {
