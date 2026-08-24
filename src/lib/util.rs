@@ -1,8 +1,8 @@
-use anyhow::Result;
-use reqwest::IntoUrl;
+use anyhow::{Context, Result, anyhow};
 use std::env;
-// use std::io;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 fn get_cwd() -> Result<PathBuf> {
     let ctx = env::current_dir()?;
@@ -54,6 +54,46 @@ pub fn format_with_prettier(path: &PathBuf) -> Result<()> {
         .status()?;
 
     Ok(())
+}
+
+// formats `data` with prettier via stdin/stdout, without ever touching disk -
+// `path` is only used so prettier can infer which parser to use from the
+// extension (it never needs to exist). blocking; meant to be run on its own
+// thread/via spawn_blocking.
+pub fn format_with_prettier_stdin(path: &Path, data: &[u8]) -> Result<Vec<u8>> {
+    let mut child = std::process::Command::new("npx")
+        .arg("prettier")
+        .arg("--stdin-filepath")
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn prettier")?;
+
+    // write on a separate thread so a large payload can't deadlock against
+    // prettier also trying to flush its own stdout back to us
+    let mut stdin = child.stdin.take().expect("child stdin was requested");
+    let data = data.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&data));
+
+    let output = child
+        .wait_with_output()
+        .context("failed to read prettier output")?;
+
+    writer
+        .join()
+        .map_err(|_| anyhow!("prettier stdin writer thread panicked"))??;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "prettier exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    Ok(output.stdout)
 }
 
 // resolves a discovered source url (relative, root-relative, protocol-relative, or
@@ -127,5 +167,26 @@ mod tests {
         let (host, path) = resolve_source_url("example.com", "/foo.js?v=123").unwrap();
         assert_eq!(host, "example.com");
         assert_eq!(path, "/foo.js?v=123");
+    }
+
+    #[test]
+    fn formats_js_via_stdin() {
+        let formatted =
+            format_with_prettier_stdin(Path::new("test.js"), b"const x={a:1,b:2}").unwrap();
+
+        // don't assert on prettier's exact formatting choices, just that it
+        // actually reformatted rather than passing the input through as-is
+        assert_ne!(formatted, b"const x={a:1,b:2}");
+        assert_eq!(
+            String::from_utf8(formatted).unwrap(),
+            "const x = { a: 1, b: 2 };\n"
+        );
+    }
+
+    #[test]
+    fn falls_back_on_prettier_failure_for_unparseable_input() {
+        let result = format_with_prettier_stdin(Path::new("test.js"), b"const x = {{{{");
+
+        assert!(result.is_err());
     }
 }

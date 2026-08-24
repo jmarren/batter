@@ -11,6 +11,7 @@ use crate::util;
 struct WriteJob {
     path: PathBuf,
     data: Vec<u8>,
+    format: bool,
 }
 
 enum Task {
@@ -41,11 +42,16 @@ impl Writer {
     }
 
     pub fn write(&self, path: impl Into<PathBuf>, data: &[u8]) -> Result<()> {
+        self.write_with(path, data, false)
+    }
+
+    fn write_with(&self, path: impl Into<PathBuf>, data: &[u8], format: bool) -> Result<()> {
         let full_path = self.base_path.join(path.into());
 
         let job = WriteJob {
             path: full_path,
             data: data.to_vec(),
+            format,
         };
 
         self.tx
@@ -53,8 +59,11 @@ impl Writer {
             .map_err(|_| anyhow!("writer's background task is no longer running"))
     }
 
+    // formats `data` with prettier before writing it
     pub fn write_js(&self, path: impl Into<PathBuf>, data: &[u8]) -> Result<()> {
-        self.write_ext(path, data, "js")
+        let mut path: PathBuf = path.into();
+        path.set_extension("js");
+        self.write_with(path, data, true)
     }
 
     pub fn write_txt(&self, path: impl Into<PathBuf>, data: &[u8]) -> Result<()> {
@@ -103,7 +112,7 @@ async fn recieve(mut rx: mpsc::UnboundedReceiver<Task>, join_set: &mut JoinSet<R
             job = rx.recv() => {
                 match job {
                     Some(Task::Write(job)) => {
-                        join_set.spawn(async move { util::write_file(job.path, &job.data).await });
+                        join_set.spawn(write_job(job));
                     },
                     Some(Task::Shutdown) => {
                         rx.close();
@@ -136,6 +145,39 @@ async fn shutdown(deadline: Duration, join_set: JoinSet<Result<()>>) {
     }
 }
 
+// formats the job's data with prettier (if requested) before writing it -
+// falls back to the original bytes if prettier fails for any reason, so a
+// single malformed/minified file (or prettier being unavailable) doesn't
+// lose that file's content
+async fn write_job(job: WriteJob) -> Result<()> {
+    let WriteJob { path, data, format } = job;
+
+    let data = if format {
+        let format_path = path.clone();
+        let original = data.clone();
+
+        match tokio::task::spawn_blocking(move || {
+            util::format_with_prettier_stdin(&format_path, &original)
+        })
+        .await
+        {
+            Ok(Ok(formatted)) => formatted,
+            Ok(Err(err)) => {
+                tracing::warn!("prettier failed for {path:?}: {err:#}");
+                data
+            }
+            Err(err) => {
+                tracing::warn!("prettier task panicked for {path:?}: {err}");
+                data
+            }
+        }
+    } else {
+        data
+    };
+
+    util::write_file(path, &data).await
+}
+
 // receives write jobs and fans each one out into a JoinSet so writes happen
 // concurrently; once the channel is closed, drains whatever's left in the
 // JoinSet, bounded by `deadline` - aborting and logging any stragglers
@@ -165,6 +207,37 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("batter-writer-test-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[tokio::test]
+    async fn write_js_formats_content_with_prettier() {
+        let dir = scratch_dir("write-js-format");
+        let writer = Writer::new(&dir, Duration::from_secs(5));
+
+        writer.write_js("messy", b"const x={a:1,b:2}").unwrap();
+
+        writer.join().await;
+
+        let contents = std::fs::read_to_string(dir.join("messy.js")).unwrap();
+        assert_eq!(contents, "const x = { a: 1, b: 2 };\n");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_js_falls_back_to_original_bytes_when_prettier_fails() {
+        let dir = scratch_dir("write-js-fallback");
+        let writer = Writer::new(&dir, Duration::from_secs(5));
+
+        let unparseable = b"const x = {{{{";
+        writer.write_js("broken", unparseable).unwrap();
+
+        writer.join().await;
+
+        let contents = std::fs::read(dir.join("broken.js")).unwrap();
+        assert_eq!(contents, unparseable);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
