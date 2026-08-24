@@ -1,128 +1,21 @@
-use std::collections::HashSet;
-
-use anyhow::{Result, anyhow};
 use oxc::{
-    allocator::Allocator,
+    allocator,
     ast::ast::{
-        Argument, ArrayExpressionElement, ArrowFunctionExpression, AssignmentExpression,
-        AssignmentTarget, CallExpression, ComputedMemberExpression, ConditionalExpression,
-        Expression, ObjectPropertyKind, PropertyKey, Statement,
+        ArrowFunctionExpression, ComputedMemberExpression, ConditionalExpression, Expression,
+        ObjectPropertyKind, PropertyKey, Statement,
     },
-    ast_visit::{Visit, walk},
-    parser::Parser,
-    span::SourceType,
 };
 
 use crate::util;
 
-pub struct JsSource {
-    source_text: String,
-    url: reqwest::Url,
-}
-
-impl JsSource {
-    pub fn new(source_text: String, url: reqwest::Url) -> Self {
-        Self { source_text, url }
-    }
-
-    pub fn parse(&self) -> Result<HashSet<String>> {
-        // create allocator
-        let allocator = Allocator::default();
-        // use default source_type
-        let source_type = SourceType::default();
-        // parse source string
-        let parsed = Parser::new(&allocator, &self.source_text, source_type).parse();
-        // none if panicked
-        if parsed.panicked {
-            return Err(anyhow!("parser panicked"));
-        }
-
-        let mut walker = JsWalker::new();
-
-        walker.visit_program(&parsed.program);
-
-        Ok(walker
-            .chunk_urls
-            .iter()
-            .map(|raw| self.resolve_chunk_url(raw))
-            .collect())
-    }
-
-    // re-roots a bundler-relative chunk path (e.g. "static/chunks/558.hash.js")
-    // under whatever mount prefix this source file's own url implies - the
-    // chunk-loader code itself only ever contains a bundler-relative path, but
-    // the file we're currently parsing must itself be served from within the
-    // same mount as the chunks it loads, so we can recover the mount by finding
-    // where the chunk path's own leading segment shows up in this source's path.
-    // falls back to joining the raw path directly against this source's url if
-    // no matching segment is found.
-    fn resolve_chunk_url(&self, raw: &str) -> String {
-        let resolved = match raw.rfind('/') {
-            Some(slash_idx) => {
-                let leading_path = &raw[..=slash_idx];
-                let source_path = self.url.path();
-
-                match source_path.find(leading_path) {
-                    Some(mount_end) => self
-                        .url
-                        .join(&format!("{}{raw}", &source_path[..mount_end])),
-                    None => self.url.join(raw),
-                }
-            }
-            None => self.url.join(raw),
-        };
-
-        match resolved {
-            Ok(url) => url.to_string(),
-            Err(_) => raw.to_string(),
-        }
-    }
-}
-
-struct JsWalker<'a> {
-    _marker: std::marker::PhantomData<&'a ()>,
-    chunk_urls: HashSet<String>,
-}
-
-impl<'a> JsWalker<'a> {
-    fn new() -> Self {
-        Self {
-            _marker: std::marker::PhantomData,
-            chunk_urls: HashSet::new(),
-        }
-    }
-}
-
-impl<'a> Visit<'a> for JsWalker<'a> {
-    // we need a visit_assignment_expression to visit all the assignments
-    // in order to locate
-    /// __webpack__require.u = chunkId =>
-    /// which will give us the chunkIds
-    fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
-        match &it.right {
-            Expression::ArrowFunctionExpression(arrow_fn) => {
-                match &it.left {
-                    AssignmentTarget::StaticMemberExpression(s) => {
-                        if s.property.name == "u" {
-                            self.chunk_urls.extend(chunk_urls(arrow_fn));
-                        }
-                    }
-                    _ => (),
-                };
-            }
-            _ => (),
-        };
-    }
-
-    // turbopack registers chunks via a `.push([scriptEl, {otherChunks: [...]}])`
-    // call, e.g. `(globalThis.TURBOPACK || (globalThis.TURBOPACK = [])).push(...)`
-    fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
-        self.chunk_urls.extend(turbopack_chunk_urls(it));
-        walk::walk_call_expression(self, it);
-    }
-}
-
-fn chunk_urls<'a>(arrow_fn: &oxc::allocator::Box<'a, ArrowFunctionExpression<'a>>) -> Vec<String> {
+// webpack's chunk-loader assigns `__webpack_require__.u`, e.g.
+// `c.u = (e) => "static/chunks/" + (6467 === e ? "c07e5374" : e) + "." + {558:
+// "097941ffb76484a3", ...}[e] + ".js"`
+// which we can statically evaluate for every entry in the id -> hash map to
+// recover every chunk url this bundle could ever load.
+pub(super) fn chunk_urls<'a>(
+    arrow_fn: &allocator::Box<'a, ArrowFunctionExpression<'a>>,
+) -> Vec<String> {
     let Some(body) = arrow_body_expression(&arrow_fn) else {
         return vec![];
     };
@@ -178,73 +71,6 @@ fn chunk_urls<'a>(arrow_fn: &oxc::allocator::Box<'a, ArrowFunctionExpression<'a>
 
     urls.extend(literal_urls);
     urls
-}
-
-// extracts chunk urls from a turbopack chunk-registration call:
-// `<anything>.push([scriptEl, {otherChunks: ["url", ...], ...}])`.
-//
-// matched loosely on the `otherChunks` array shape alone, rather than requiring
-// the callee to reference a `TURBOPACK` global - property names like
-// `otherChunks` survive minification (renaming them would break other code that
-// reads the property by name), while the exact guard expression around the
-// global (`globalThis` vs `self`, differing `||` fallbacks) can vary.
-fn turbopack_chunk_urls(call: &CallExpression) -> Vec<String> {
-    let Expression::StaticMemberExpression(callee) = &call.callee else {
-        return vec![];
-    };
-
-    if callee.property.name != "push" {
-        return vec![];
-    }
-
-    let Some(Argument::ArrayExpression(arr)) = call.arguments.first() else {
-        return vec![];
-    };
-
-    let other_chunks = arr.elements.iter().find_map(|el| match el {
-        ArrayExpressionElement::ObjectExpression(o) => find_other_chunks(o),
-        _ => None,
-    });
-
-    let Some(other_chunks) = other_chunks else {
-        return vec![];
-    };
-
-    other_chunks
-        .elements
-        .iter()
-        .filter_map(|el| match el {
-            ArrayExpressionElement::StringLiteral(s) => s.raw.as_deref().map(util::strip_quotes),
-            _ => None,
-        })
-        .collect()
-}
-
-// find an `otherChunks: [...]` property on an object expression and return its
-// array value
-fn find_other_chunks<'e>(
-    obj: &'e oxc::ast::ast::ObjectExpression<'e>,
-) -> Option<&'e oxc::ast::ast::ArrayExpression<'e>> {
-    obj.properties.iter().find_map(|prop| {
-        let ObjectPropertyKind::ObjectProperty(prop) = prop else {
-            return None;
-        };
-
-        let key_matches = match &prop.key {
-            PropertyKey::StaticIdentifier(id) => id.name == "otherChunks",
-            PropertyKey::StringLiteral(s) => s.value == "otherChunks",
-            _ => false,
-        };
-
-        if !key_matches {
-            return None;
-        }
-
-        match &prop.value {
-            Expression::ArrayExpression(arr) => Some(arr.as_ref()),
-            _ => None,
-        }
-    })
 }
 
 // peels off any number of leading `<id> === e ? "<full literal path>" : <rest>`
@@ -364,7 +190,9 @@ fn arrow_body_expression<'a, 'b>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::HashSet;
+
+    use crate::js::JsSource;
 
     #[test]
     fn extracts_urls_from_simple_hash_map() {
@@ -388,7 +216,8 @@ mod tests {
 
         let urls = JsSource::new(source.to_string(), source_url)
             .parse()
-            .unwrap();
+            .unwrap()
+            .chunk_urls;
 
         assert_eq!(
             urls,
@@ -508,7 +337,8 @@ mod tests {
 
         let urls = JsSource::new(source.to_string(), source_url)
             .parse()
-            .unwrap();
+            .unwrap()
+            .chunk_urls;
 
         // the hardcoded literal-path override for chunk 6918
         assert!(urls.contains("https://example.com/_next/static/chunks/6918-9e9acda1c00665ed.js"));
@@ -526,42 +356,6 @@ mod tests {
         // 87 entries in the map, plus the 6918 literal override url (which
         // never appears in the map itself)
         assert_eq!(urls.len(), 87 + 1);
-    }
-
-    #[test]
-    fn extracts_urls_from_turbopack_push() {
-        let source = r#"
-            (globalThis.TURBOPACK || (globalThis.TURBOPACK = [])).push([
-              "object" == typeof document ? document.currentScript : void 0,
-              {
-                otherChunks: [
-                  "static/immutable/chunks/236-04af9ww4u.js",
-                  "static/immutable/chunks/0ifbgewhks2yb.js",
-                  "static/immutable/chunks/2ko36sx9hycil.js",
-                  "static/immutable/chunks/2tt92x9jwpwmi.js",
-                ],
-                runtimeModuleIds: [554156],
-              },
-            ]);
-        "#;
-
-        // no path segment shared with the chunk urls below, so resolution
-        // falls back to a plain join against this source's url
-        let source_url = reqwest::Url::parse("https://example.com/entry.js").unwrap();
-
-        let urls = JsSource::new(source.to_string(), source_url)
-            .parse()
-            .unwrap();
-
-        assert_eq!(
-            urls,
-            HashSet::from([
-                "https://example.com/static/immutable/chunks/236-04af9ww4u.js".to_string(),
-                "https://example.com/static/immutable/chunks/0ifbgewhks2yb.js".to_string(),
-                "https://example.com/static/immutable/chunks/2ko36sx9hycil.js".to_string(),
-                "https://example.com/static/immutable/chunks/2tt92x9jwpwmi.js".to_string(),
-            ])
-        );
     }
 
     #[test]
@@ -585,7 +379,8 @@ mod tests {
 
         let urls = JsSource::new(source.to_string(), source_url)
             .parse()
-            .unwrap();
+            .unwrap()
+            .chunk_urls;
 
         assert_eq!(
             urls,

@@ -1,11 +1,12 @@
 use std::collections::HashSet;
+use std::sync::Mutex;
 
 use anyhow::{Result, anyhow};
 use tokio::task::{JoinError, JoinSet};
 
 use crate::{
     html,
-    js::JsSource,
+    js::source::JsSource,
     util::{self},
     writer::Writer,
 };
@@ -15,6 +16,11 @@ pub struct Site {
     allow_external_sources: bool,
     writer: Writer,
     client: reqwest::Client,
+    // http endpoints referenced by fetched js, accumulated across the whole
+    // crawl and written to endpoints.txt at the end. needs interior
+    // mutability since parse_chunk_urls is &self and runs concurrently
+    // across many spawned tasks.
+    endpoints: Mutex<HashSet<String>>,
 }
 
 impl Site {
@@ -24,6 +30,7 @@ impl Site {
             writer,
             client: reqwest::Client::new(),
             allow_external_sources: false,
+            endpoints: Mutex::new(HashSet::new()),
         }
     }
 
@@ -96,10 +103,26 @@ impl Site {
         // handle sources
         self.handle_sources(sources).await?;
 
+        // write every discovered http endpoint to endpoints.txt
+        self.write_endpoints()?;
+
+        tracing::info!("joining writer");
+
         // wait for all background writes to finish (bounded by the writer's deadline)
         self.writer.join().await;
 
         Ok(())
+    }
+
+    fn write_endpoints(&self) -> Result<()> {
+        let endpoints: Vec<String> = self.endpoints.lock().unwrap().iter().cloned().collect();
+
+        if endpoints.is_empty() {
+            return Ok(());
+        }
+
+        self.writer
+            .write("endpoints.txt", endpoints.join("\n").as_bytes())
     }
 
     // handle source urls returned from document
@@ -163,8 +186,13 @@ impl Site {
         // create new JsSource object from data
         let js_source = JsSource::new(String::from_utf8(bytes)?, src_url.clone());
 
-        // parse the source and return any chunk urls found
-        let url_strs = js_source.parse()?.into_iter().collect();
+        // parse the source, record any endpoints found, and return the
+        // chunk urls found so the caller can fetch them
+        let parsed = js_source.parse()?;
+
+        self.endpoints.lock().unwrap().extend(parsed.endpoints);
+
+        let url_strs = parsed.chunk_urls.into_iter().collect();
 
         Ok(self.resolve_sources(url_strs))
     }
