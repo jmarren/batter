@@ -91,11 +91,17 @@ impl Site {
 
     // run enumeration on the site
     pub async fn enumerate(&mut self) -> Result<()> {
-        // fetch html
-        let doc = self.fetch_html().await?;
+        // fetch html. html::Document wraps scraper::Html, which isn't Send,
+        // so it's scoped to end before the next await point - otherwise the
+        // enclosing future isn't Send (needed to run each site's crawl as
+        // its own spawned task when crawling multiple domains concurrently)
+        let doc_sources = {
+            let doc = self.fetch_html().await?;
+            doc.sources()
+        };
 
         // resolve sources to reqwest::Urls
-        let all_sources = self.resolve_sources(doc.sources());
+        let all_sources = self.resolve_sources(doc_sources);
 
         // apply any necessary filters
         let sources = self.apply_source_filters(all_sources);
