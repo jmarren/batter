@@ -97,12 +97,7 @@ impl Writer {
     }
 }
 
-// receives write jobs and fans each one out into a JoinSet so writes happen
-// concurrently; once the channel is closed, drains whatever's left in the
-// JoinSet, bounded by `deadline` - aborting and logging any stragglers
-async fn run_consumer(mut rx: mpsc::UnboundedReceiver<Task>, deadline: Duration) {
-    let mut join_set: JoinSet<Result<()>> = JoinSet::new();
-
+async fn recieve(mut rx: mpsc::UnboundedReceiver<Task>, join_set: &mut JoinSet<Result<()>>) {
     loop {
         tokio::select! {
             job = rx.recv() => {
@@ -111,6 +106,7 @@ async fn run_consumer(mut rx: mpsc::UnboundedReceiver<Task>, deadline: Duration)
                         join_set.spawn(async move { util::write_file(job.path, &job.data).await });
                     },
                     Some(Task::Shutdown) => {
+                        rx.close();
                         break;
                     },
                     None => break,
@@ -121,11 +117,10 @@ async fn run_consumer(mut rx: mpsc::UnboundedReceiver<Task>, deadline: Duration)
             }
         }
     }
+}
 
+async fn shutdown(deadline: Duration, join_set: JoinSet<Result<()>>) {
     let pending = join_set.len();
-
-    // if the timeout fires, the future driving join_all (and the JoinSet it
-    // owns) is dropped, which aborts every remaining task automatically
     match tokio::time::timeout(deadline, join_set.join_all()).await {
         Ok(results) => {
             for result in results {
@@ -139,6 +134,19 @@ async fn run_consumer(mut rx: mpsc::UnboundedReceiver<Task>, deadline: Duration)
             );
         }
     }
+}
+
+// receives write jobs and fans each one out into a JoinSet so writes happen
+// concurrently; once the channel is closed, drains whatever's left in the
+// JoinSet, bounded by `deadline` - aborting and logging any stragglers
+async fn run_consumer(rx: mpsc::UnboundedReceiver<Task>, deadline: Duration) {
+    let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+
+    // run the receiving loop
+    recieve(rx, &mut join_set).await;
+
+    // wait for the deadline
+    shutdown(deadline, join_set).await;
 }
 
 fn log_write_result(result: std::result::Result<Result<()>, tokio::task::JoinError>) {

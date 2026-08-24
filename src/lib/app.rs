@@ -58,6 +58,8 @@ impl App {
 
 #[tokio::main]
 pub async fn start() {
+    let started_at = std::time::Instant::now();
+
     // parse .env
     dotenvy::dotenv().ok();
 
@@ -73,4 +75,6 @@ pub async fn start() {
     let mut app = App::from_cli(args).unwrap();
 
     app.run().await.unwrap();
+
+    tracing::info!("finished in {:?}", started_at.elapsed());
 }
