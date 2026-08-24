@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::site::Site;
 
+mod domain;
 mod html;
 mod js;
 mod site;

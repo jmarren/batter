@@ -1,0 +1,67 @@
+%% Public-API-only view, derived from uml/class-diagram.md.
+%% Includes only items marked `+` (pub) there. Note: every top-level module in
+%% this crate is declared as a private `mod` in src/lib/app.rs (none are
+%% `pub mod`), so strictly speaking nothing below is actually reachable from
+%% outside the crate except `batter::start()` (src/lib/app.rs). This diagram
+%% instead reflects each type's own `pub`-marked surface, i.e. what's public
+%% relative to its own struct/impl, which is the more useful reading for
+%% understanding intended API boundaries within the codebase.
+%%
+%% Classes with no pub-marked members in the source diagram (App, Cli,
+%% run_consumer, JsVisitor, js::webpack, js::turbopack, js::endpoints, the
+%% dead top-level webpack module, and util) are omitted entirely.
+
+classDiagram
+
+    class Cli {
+        <<clap Parser>>
+        +domain: String
+        +out_dir: PathBuf
+        +allow_external_sources: bool
+    }
+
+    class App {
+        +from_cli(cli: Cli) Result~App~
+        +run() Result~()~
+    }
+
+    class Site {
+        +new(writer, url) Site
+        +allow_external_sources() Site
+        +enumerate() Result~()~
+    }
+
+    class Writer {
+        +new(base_path, deadline) Writer
+        +write(path, data) Result~()~
+        +write_js(path, data) Result~()~ "formats via prettier first"
+        +write_txt(path, data) Result~()~
+        +write_html(path, data) Result~()~
+        +write_ext(path, data, ext) Result~()~
+        +join() "awaits background consumer, deadline-bounded"
+    }
+
+    class Document {
+        +new(bytes) Result~Document~
+        +sources() Vec~String~
+    }
+
+    class ParseResult {
+        <<js::source::ParseResult>>
+        +chunk_urls: HashSet~String~
+        +endpoints: HashSet~String~
+    }
+
+    class JsSource {
+        <<js::source>>
+        +new(source_text, url) JsSource
+        +parse() Result~ParseResult~
+    }
+
+    cli_bin ..> App : "calls batter::start()"
+    App "1" *-- "1" Cli : constructed from
+    App "1" *-- "1" Site : owns
+    Site "1" *-- "1" Writer : owns
+    Site ..> Document : creates in fetch_html()
+    Site ..> JsSource : creates per fetched js source
+    JsSource ..> ParseResult : returns from parse()

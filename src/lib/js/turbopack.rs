@@ -75,7 +75,7 @@ fn find_other_chunks<'e>(
 mod tests {
     use std::collections::HashSet;
 
-    use crate::js::JsSource;
+    use crate::js::source::JsSource;
 
     #[test]
     fn extracts_urls_from_turbopack_push() {

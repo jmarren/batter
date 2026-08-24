@@ -192,7 +192,7 @@ fn arrow_body_expression<'a, 'b>(
 mod tests {
     use std::collections::HashSet;
 
-    use crate::js::JsSource;
+    use crate::js::source::JsSource;
 
     #[test]
     fn extracts_urls_from_simple_hash_map() {

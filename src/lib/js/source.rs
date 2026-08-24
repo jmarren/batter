@@ -36,7 +36,7 @@ impl JsSource {
             return Err(anyhow!("parser panicked"));
         }
 
-        let parse_result = visitor::JsVisitor::new().parse(parsed.program);
+        let mut parse_result = visitor::JsVisitor::new().parse(parsed.program);
 
         let chunk_urls = parse_result
             .chunk_urls
@@ -44,10 +44,9 @@ impl JsSource {
             .map(|raw| self.resolve_chunk_url(raw))
             .collect();
 
-        Ok(ParseResult {
-            chunk_urls,
-            endpoints: parse_result.endpoints,
-        })
+        parse_result.chunk_urls = chunk_urls;
+
+        Ok(parse_result)
     }
 
     // re-roots a bundler-relative chunk path (e.g. "static/chunks/558.hash.js")

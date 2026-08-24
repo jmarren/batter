@@ -5,15 +5,10 @@ use oxc::{
     ast_visit::{Visit, walk},
 };
 
-use crate::js::{endpoints, turbopack, webpack};
+use crate::js::{endpoints, source::ParseResult, turbopack, webpack};
 
 pub struct JsVisitor<'a> {
     _marker: std::marker::PhantomData<&'a ()>,
-    pub chunk_urls: HashSet<String>,
-    pub endpoints: HashSet<String>,
-}
-
-pub struct ParseResult {
     pub chunk_urls: HashSet<String>,
     pub endpoints: HashSet<String>,
 }

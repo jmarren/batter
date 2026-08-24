@@ -63,22 +63,26 @@ classDiagram
     }
 
     class ParseResult {
+        <<js::source::ParseResult - single shared type,\nreturned by both JsSource::parse()\nand JsVisitor::parse()>>
         +chunk_urls: HashSet~String~
         +endpoints: HashSet~String~
     }
 
     class JsSource {
+        <<js::source, pub>>
         -source_text: String
         -url: reqwest::Url
         +new(source_text, url) JsSource
-        +parse() Result~ParseResult~
+        +parse() Result~ParseResult~ "re-resolves chunk_urls in place\nagainst this source's mount"
         -resolve_chunk_url(raw) String
     }
 
-    class JsWalker {
-        <<implements oxc::Visit, private to js::mod>>
-        -chunk_urls: HashSet~String~
-        -endpoints: HashSet~String~
+    class JsVisitor {
+        <<js::visitor, implements oxc::Visit>>
+        +chunk_urls: HashSet~String~
+        +endpoints: HashSet~String~
+        +new() JsVisitor
+        +parse(program) ParseResult
         +visit_assignment_expression(it) "dispatches to js::webpack"
         +visit_call_expression(it) "dispatches to js::turbopack + js::endpoints"
     }
@@ -140,10 +144,11 @@ classDiagram
     Site ..> JsSource : creates per fetched js source
     Site ..> util : fetch_url()
     JsSource ..> ParseResult : returns from parse()
-    JsSource "1" *-- "1" JsWalker : creates in parse()
-    JsWalker ..> js_webpack : chunk_urls()
-    JsWalker ..> js_turbopack : turbopack_chunk_urls()
-    JsWalker ..> js_endpoints : extract_endpoint()
+    JsSource ..> JsVisitor : creates in parse()
+    JsVisitor ..> ParseResult : returns from its own parse()
+    JsVisitor ..> js_webpack : chunk_urls()
+    JsVisitor ..> js_turbopack : turbopack_chunk_urls()
+    JsVisitor ..> js_endpoints : extract_endpoint()
     js_webpack ..> util : strip_quotes()
     js_turbopack ..> util : strip_quotes()
     js_endpoints ..> util : strip_quotes()
@@ -152,30 +157,32 @@ classDiagram
 
 ## Notes
 
-Rebuilt from a fresh read of the current source (`app.rs`, `site.rs`, `writer.rs`,
-`html.rs`, `util.rs`, and the `js/` module: `mod.rs`, `webpack.rs`, `turbopack.rs`,
-`endpoints.rs`) — the previous version of this diagram predated several rounds of
-work and no longer matched the code (`Site` had a completely different field/method
-set, `JsSource`/`js.rs` had not yet split into a module or gained endpoint
-detection, and `Writer` did not yet exist in its current channel-based form).
+Updated after commit `c2c5607` ("refactoring some js/ stuff") and a couple of
+follow-up fixes made directly on top of it while producing this diagram. The
+public surface (`Site`, `Writer`, and the crate-level module wiring) is unchanged
+from before; what moved is entirely internal to `js/`:
 
-Notable structural points captured here:
-
-- **`js.rs` is now the `js/` directory module** (`mod.rs`, `webpack.rs`,
-  `turbopack.rs`, `endpoints.rs`), split along its three concerns while keeping the
-  same public API (`JsSource::new`/`parse`, `ParseResult`). `JsWalker` is the single
-  AST visitor that drives all three detectors in one pass.
-- **`Writer` now does writes in the background** via an internal `mpsc` channel and
-  a spawned `run_consumer` task, rather than writing inline on the calling task.
-  `write_js` additionally formats content through prettier (via
-  `util::format_with_prettier_stdin`) before handing it to the consumer, falling
-  back to the original bytes if formatting fails.
-- **`Site` gained an `endpoints` field** (`Mutex<HashSet<String>>`) accumulating
-  HTTP endpoints discovered while parsing fetched JS, written out to
-  `endpoints.txt` at the end of `enumerate()` — alongside the existing
-  `index.html`/chunk files written via `Writer`.
-- Two dead-code pockets remain, both confirmed by reading the current source: the
-  top-level `src/lib/webpack.rs` module (superseded by `js::webpack`, never called
-  from anywhere), and two functions in `util.rs` — `format_with_prettier` (in-place
-  disk formatting, superseded by the stdin-based variant used by `Writer`) and
-  `resolve_source_url` (superseded by `Site`'s own `reqwest::Url`-based resolution).
+- **`js/mod.rs`** is now pure module declarations: `mod endpoints; pub mod
+  source; mod turbopack; mod visitor; mod webpack;`.
+- **`JsSource` and `ParseResult` live in `js/source.rs`**, and `JsSource` is no
+  longer re-exported at the `js` module root — callers need
+  `crate::js::source::JsSource` (confirmed via `site.rs`'s import). The old
+  `crate::js::JsSource` path no longer resolves.
+- **`JsWalker` was renamed to `JsVisitor` and moved to `js/visitor.rs`**, with a
+  `parse(program) -> ParseResult` method doing the `visit_program` +
+  result-extraction step previously inlined in `JsSource::parse`. `ParseResult`
+  is a single shared type (`js::source::ParseResult`, imported into `visitor.rs`
+  via `use crate::js::source::ParseResult`) rather than two separate structs —
+  `JsSource::parse` takes the `ParseResult` `JsVisitor::parse` returns and
+  mutates `chunk_urls` in place to re-resolve each one against the source's
+  mount, leaving `endpoints` untouched.
+- **Found and fixed while updating this diagram**: `js/webpack.rs` and
+  `js/turbopack.rs`'s test modules still imported the now-nonexistent
+  `crate::js::JsSource` (a leftover from before `JsSource` moved to
+  `js::source`), which broke `cargo test --lib` on `main`. Updated both to
+  `crate::js::source::JsSource`; all 27 tests pass again.
+- Same two dead-code pockets as before: the top-level `src/lib/webpack.rs` module
+  (superseded by `js::webpack`, never called from anywhere), and two functions in
+  `util.rs` — `format_with_prettier` (superseded by the stdin-based variant used
+  by `Writer`) and `resolve_source_url` (superseded by `Site`'s own
+  `reqwest::Url`-based resolution).
