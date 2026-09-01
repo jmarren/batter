@@ -12,6 +12,7 @@ pub async fn enumerate_subdomains(domain: &str) -> Result<HashSet<String>> {
         .arg("-d")
         .arg(domain)
         .arg("-silent")
+        .arg("-all")
         .output()
         .await
         .map_err(|err| anyhow!("failed to run subfinder (is it installed and on PATH?): {err}"))?;

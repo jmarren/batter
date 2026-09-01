@@ -6,12 +6,14 @@ use oxc::{allocator::Allocator, parser::Parser, span::SourceType};
 use crate::js::visitor;
 
 // results of parsing one js source: chunk urls (already resolved against the
-// site) and any http endpoints referenced via recognized request calls
+// site), any http endpoints referenced via recognized request calls
 // (fetch/axios/xhr/jquery - not resolved against anything, just the static
-// skeleton of whatever was passed as the url argument)
+// skeleton of whatever was passed as the url argument), and any string
+// literals in the source that look like absolute http/https urls
 pub struct ParseResult {
     pub chunk_urls: HashSet<String>,
     pub endpoints: HashSet<String>,
+    pub urls: HashSet<String>,
 }
 
 pub struct JsSource {

@@ -1,16 +1,19 @@
 use std::collections::HashSet;
 
 use oxc::{
-    ast::ast::{AssignmentExpression, AssignmentTarget, CallExpression, Expression, Program},
+    ast::ast::{
+        AssignmentExpression, AssignmentTarget, CallExpression, Expression, Program, StringLiteral,
+    },
     ast_visit::{Visit, walk},
 };
 
-use crate::js::{endpoints, source::ParseResult, turbopack, webpack};
+use crate::js::{buildmanifest, endpoints, source::ParseResult, turbopack, urls, webpack};
 
 pub struct JsVisitor<'a> {
     _marker: std::marker::PhantomData<&'a ()>,
     pub chunk_urls: HashSet<String>,
     pub endpoints: HashSet<String>,
+    pub urls: HashSet<String>,
 }
 
 impl<'a> JsVisitor<'a> {
@@ -19,6 +22,7 @@ impl<'a> JsVisitor<'a> {
             _marker: std::marker::PhantomData,
             chunk_urls: HashSet::new(),
             endpoints: HashSet::new(),
+            urls: HashSet::new(),
         }
     }
 
@@ -28,6 +32,7 @@ impl<'a> JsVisitor<'a> {
         ParseResult {
             chunk_urls: self.chunk_urls,
             endpoints: self.endpoints,
+            urls: self.urls,
         }
     }
 }
@@ -49,6 +54,11 @@ impl<'a> Visit<'a> for JsVisitor<'a> {
                     _ => (),
                 };
             }
+            // next.js `self.__BUILD_MANIFEST = function(...) { return {...} }(...)`
+            Expression::CallExpression(call) => {
+                self.chunk_urls
+                    .extend(buildmanifest::build_manifest_chunk_urls(&it.left, call));
+            }
             _ => (),
         };
     }
@@ -63,5 +73,11 @@ impl<'a> Visit<'a> for JsVisitor<'a> {
         }
 
         walk::walk_call_expression(self, it);
+    }
+
+    fn visit_string_literal(&mut self, it: &StringLiteral<'a>) {
+        if urls::is_url(&it.value) {
+            self.urls.insert(it.value.to_string());
+        }
     }
 }

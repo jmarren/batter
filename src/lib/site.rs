@@ -21,6 +21,10 @@ pub struct Site {
     // mutability since parse_chunk_urls is &self and runs concurrently
     // across many spawned tasks.
     endpoints: Mutex<HashSet<String>>,
+    // absolute http/https urls found in string literals in fetched js,
+    // accumulated across the whole crawl and written to urls.txt at the end.
+    // same interior mutability rationale as endpoints.
+    urls: Mutex<HashSet<String>>,
 }
 
 impl Site {
@@ -31,6 +35,7 @@ impl Site {
             client: reqwest::Client::new(),
             allow_external_sources: false,
             endpoints: Mutex::new(HashSet::new()),
+            urls: Mutex::new(HashSet::new()),
         }
     }
 
@@ -112,6 +117,9 @@ impl Site {
         // write every discovered http endpoint to endpoints.txt
         self.write_endpoints()?;
 
+        // write every discovered url to urls.txt
+        self.write_urls()?;
+
         tracing::info!("joining writer");
 
         // wait for all background writes to finish (bounded by the writer's deadline)
@@ -129,6 +137,16 @@ impl Site {
 
         self.writer
             .write("endpoints.txt", endpoints.join("\n").as_bytes())
+    }
+
+    fn write_urls(&self) -> Result<()> {
+        let urls: Vec<String> = self.urls.lock().unwrap().iter().cloned().collect();
+
+        if urls.is_empty() {
+            return Ok(());
+        }
+
+        self.writer.write("urls.txt", urls.join("\n").as_bytes())
     }
 
     // handle source urls returned from document
@@ -197,6 +215,7 @@ impl Site {
         let parsed = js_source.parse()?;
 
         self.endpoints.lock().unwrap().extend(parsed.endpoints);
+        self.urls.lock().unwrap().extend(parsed.urls);
 
         let url_strs = parsed.chunk_urls.into_iter().collect();
 
