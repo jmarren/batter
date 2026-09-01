@@ -56,16 +56,22 @@ impl JsSource {
     // chunk-loader code itself only ever contains a bundler-relative path, but
     // the file we're currently parsing must itself be served from within the
     // same mount as the chunks it loads, so we can recover the mount by finding
-    // where the chunk path's own leading segment shows up in this source's path.
+    // where the chunk path's own first segment (e.g. "static/") shows up in
+    // this source's path, then rerooting from there - matching on just the
+    // first segment (rather than the raw path's full leading directory)
+    // handles chunk paths nested deeper than the source file itself, e.g. a
+    // next.js build manifest living at ".../static/<buildId>/_buildManifest.js"
+    // referencing chunks at "static/chunks/pages/foo.js": the manifest's own
+    // path only shares "static/" with the chunk path, not "static/chunks/pages/".
     // falls back to joining the raw path directly against this source's url if
     // no matching segment is found.
     fn resolve_chunk_url(&self, raw: &str) -> String {
-        let resolved = match raw.rfind('/') {
+        let resolved = match raw.find('/') {
             Some(slash_idx) => {
-                let leading_path = &raw[..=slash_idx];
+                let first_segment = &raw[..=slash_idx];
                 let source_path = self.url.path();
 
-                match source_path.find(leading_path) {
+                match source_path.find(first_segment) {
                     Some(mount_end) => self
                         .url
                         .join(&format!("{}{raw}", &source_path[..mount_end])),

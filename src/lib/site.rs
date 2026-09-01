@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use tokio::task::{JoinError, JoinSet};
@@ -11,11 +11,43 @@ use crate::{
     writer::Writer,
 };
 
+// reqwest's default redirect policy (10 hops, loop detection) but recording
+// each hop's status and target url as it's followed, so the caller can
+// report the full chain instead of only ever seeing the final response.
+const MAX_REDIRECTS: usize = 10;
+
+fn redirect_policy(log: Arc<Mutex<Vec<String>>>) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        log.lock()
+            .unwrap()
+            .push(format!("{} -> {}", attempt.status(), attempt.url()));
+
+        if attempt.previous().len() >= MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
 pub struct Site {
-    url: reqwest::Url,
+    // where the initial html request is actually sent - may carry a path
+    // (e.g. a site that only serves its app under "/app") if the caller
+    // wants the crawl to start somewhere other than the root.
+    fetch_url: reqwest::Url,
+    // root of the site (fetch_url with path/query/fragment stripped) - every
+    // other url (js source resolution, external-source filtering, chunk
+    // rerooting) stays anchored here regardless of where the initial fetch
+    // started, so a non-root start path doesn't throw off downstream logic.
+    base_url: reqwest::Url,
     allow_external_sources: bool,
     writer: Writer,
     client: reqwest::Client,
+    // hops recorded by the initial html request's redirect policy, in the
+    // order they were followed. populated synchronously during fetch_html,
+    // before any concurrent js-fetching starts, so this doesn't need a mutex
+    // the way endpoints/urls do.
+    redirects: Arc<Mutex<Vec<String>>>,
     // http endpoints referenced by fetched js, accumulated across the whole
     // crawl and written to endpoints.txt at the end. needs interior
     // mutability since parse_chunk_urls is &self and runs concurrently
@@ -28,11 +60,32 @@ pub struct Site {
 }
 
 impl Site {
-    pub fn new(writer: Writer, url: reqwest::Url) -> Self {
+    // `fetch_url` is requested as-is for the initial html fetch, so it may
+    // carry a path/query if the caller wants the crawl to start somewhere
+    // other than the root. everything downstream (source resolution,
+    // external-source filtering, chunk rerooting) is anchored to its root
+    // instead, so a non-root start path never throws off that logic.
+    pub fn new(writer: Writer, fetch_url: reqwest::Url) -> Self {
+        let mut base_url = fetch_url.clone();
+        base_url.set_path("");
+        base_url.set_query(None);
+        base_url.set_fragment(None);
+
+        let redirects = Arc::new(Mutex::new(Vec::new()));
+
+        let client = reqwest::Client::builder()
+            .redirect(redirect_policy(redirects.clone()))
+            .build()
+            // only fails on tls backend init, which reqwest::Client::new()
+            // would also panic on - matches its own documented behavior
+            .expect("failed to build http client");
+
         Self {
-            url,
+            fetch_url,
+            base_url,
             writer,
-            client: reqwest::Client::new(),
+            client,
+            redirects,
             allow_external_sources: false,
             endpoints: Mutex::new(HashSet::new()),
             urls: Mutex::new(HashSet::new()),
@@ -44,15 +97,15 @@ impl Site {
         self
     }
 
-    // fetch html from domain, write it to file, and return document struct
+    // fetch html from domain, write it (and the response headers/any
+    // redirects followed to get it) to file, and return document struct
     async fn fetch_html(&mut self) -> Result<html::Document> {
-        let res = self
-            .client
-            .get(self.url.join("")?)
-            .send()
-            .await?
-            .bytes()
-            .await?;
+        let response = self.client.get(self.fetch_url.clone()).send().await?;
+
+        self.write_headers(response.headers())?;
+        self.write_redirects()?;
+
+        let res = response.bytes().await?;
 
         self.writer.write("index.html", &res)?;
 
@@ -60,13 +113,39 @@ impl Site {
         Ok(html::Document::new(&res)?)
     }
 
+    // writes the initial html request's response headers to headers.txt, one
+    // "name: value" per line
+    fn write_headers(&self, headers: &reqwest::header::HeaderMap) -> Result<()> {
+        let lines: Vec<String> = headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {}", value.to_str().unwrap_or("<invalid>")))
+            .collect();
+
+        self.writer
+            .write("headers.txt", lines.join("\n").as_bytes())
+    }
+
+    // writes every redirect hop followed while fetching the initial html to
+    // redirects.txt, one "<status> -> <location>" per line in the order they
+    // were followed. skipped if the request landed with no redirects.
+    fn write_redirects(&self) -> Result<()> {
+        let redirects = self.redirects.lock().unwrap();
+
+        if redirects.is_empty() {
+            return Ok(());
+        }
+
+        self.writer
+            .write("redirects.txt", redirects.join("\n").as_bytes())
+    }
+
     /// resolves a list of js source urls to reqwest::Urls
-    /// using self.url
+    /// using self.base_url
     fn resolve_sources(&self, source_strs: Vec<String>) -> Vec<reqwest::Url> {
         source_strs
             .iter()
             // join with base url.
-            .filter_map(|src| match self.url.join(src) {
+            .filter_map(|src| match self.base_url.join(src) {
                 Ok(x) => Some(x),
                 // filter out and report if failed
                 Err(e) => {
@@ -90,7 +169,7 @@ impl Site {
     fn filter_external(&self, sources: Vec<reqwest::Url>) -> Vec<reqwest::Url> {
         sources
             .into_iter()
-            .filter(|src| src.domain() == self.url.domain())
+            .filter(|src| src.domain() == self.base_url.domain())
             .collect()
     }
 

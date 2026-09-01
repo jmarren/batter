@@ -31,6 +31,13 @@ const DEFAULT_WRITER_DEADLINE_SECS: u64 = 60;
 
 #[derive(Parser, Debug)]
 struct Cli {
+    // target to crawl - a bare host ("example.com") or a full url, optionally
+    // with a path ("example.com/app", "https://example.com/app"). when a
+    // path is given, only the initial html fetch for this target starts
+    // there; every other target (subdomains discovered via
+    // --enumerate-subdomains) still starts at its own root, and all
+    // downstream resolution (js sources, chunk urls, external-source
+    // filtering) stays anchored to the bare host regardless.
     domain: String,
     #[arg(default_value = ".")]
     out_dir: PathBuf,
@@ -49,7 +56,12 @@ struct Cli {
 }
 
 struct App {
+    // bare host parsed out of the cli's target - used for subdomain
+    // enumeration, out_dir naming, and targets.txt
     domain: String,
+    // the exact url the root target's initial html fetch should hit - keeps
+    // whatever path/query the user passed on the cli, if any
+    start_url: reqwest::Url,
     out_dir: PathBuf,
     allow_external_sources: bool,
     enumerate_subdomains: bool,
@@ -59,9 +71,16 @@ struct App {
 impl App {
     fn from_cli(cli: Cli) -> Result<Self> {
         let out_dir = util::full_path(cli.out_dir)?;
+        let start_url = parse_target_url(&cli.domain)?;
+
+        let domain = start_url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("target url {start_url} has no host"))?
+            .to_string();
 
         Ok(Self {
-            domain: cli.domain,
+            domain,
+            start_url,
             out_dir,
             allow_external_sources: cli.allow_external_sources,
             enumerate_subdomains: cli.enumerate_subdomains,
@@ -104,7 +123,15 @@ impl App {
 
     fn build_site(&self, target: &str) -> Result<Site> {
         let writer = writer::Writer::new(self.out_dir.join(target), self.write_deadline);
-        let url = reqwest::Url::parse(&format!("https://{target}"))?;
+
+        // only the originally-typed target starts at whatever path the user
+        // passed on the cli - a discovered subdomain has no relationship to
+        // that path, so it always starts at its own root
+        let url = if target == self.domain {
+            self.start_url.clone()
+        } else {
+            reqwest::Url::parse(&format!("https://{target}"))?
+        };
 
         let mut site = Site::new(writer, url);
 
@@ -160,6 +187,18 @@ impl App {
     }
 }
 
+// parses the cli's target into a full url, defaulting to https when no
+// scheme was given - accepts a bare host ("example.com"), a host with a path
+// ("example.com/app"), or an already-complete url ("https://example.com/app")
+fn parse_target_url(target: &str) -> Result<reqwest::Url> {
+    if let Ok(url) = reqwest::Url::parse(target) {
+        return Ok(url);
+    }
+
+    reqwest::Url::parse(&format!("https://{target}"))
+        .map_err(|err| anyhow::anyhow!("invalid target {target:?}: {err}"))
+}
+
 #[tokio::main]
 pub async fn start() {
     let started_at = std::time::Instant::now();
@@ -181,4 +220,37 @@ pub async fn start() {
     app.run().await.unwrap();
 
     tracing::info!("finished in {:?}", started_at.elapsed());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_bare_host() {
+        let url = parse_target_url("example.com").unwrap();
+        assert_eq!(url.as_str(), "https://example.com/");
+        assert_eq!(url.host_str(), Some("example.com"));
+        assert_eq!(url.path(), "/");
+    }
+
+    #[test]
+    fn parses_bare_host_with_path() {
+        let url = parse_target_url("example.com/app").unwrap();
+        assert_eq!(url.as_str(), "https://example.com/app");
+        assert_eq!(url.host_str(), Some("example.com"));
+        assert_eq!(url.path(), "/app");
+    }
+
+    #[test]
+    fn preserves_explicit_scheme_and_path() {
+        let url = parse_target_url("https://example.com/app?x=1").unwrap();
+        assert_eq!(url.as_str(), "https://example.com/app?x=1");
+    }
+
+    #[test]
+    fn preserves_explicit_http_scheme() {
+        let url = parse_target_url("http://example.com").unwrap();
+        assert_eq!(url.scheme(), "http");
+    }
 }
