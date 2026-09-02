@@ -3,11 +3,12 @@ use std::collections::HashSet;
 use oxc::{
     ast::ast::{
         AssignmentExpression, AssignmentTarget, CallExpression, Expression, Program, StringLiteral,
+        VariableDeclarator,
     },
     ast_visit::{Visit, walk},
 };
 
-use crate::js::{buildmanifest, endpoints, source::ParseResult, turbopack, urls, webpack};
+use crate::js::{buildmanifest, endpoints, source::ParseResult, turbopack, urls, vite, webpack};
 
 pub struct JsVisitor<'a> {
     _marker: std::marker::PhantomData<&'a ()>,
@@ -79,5 +80,11 @@ impl<'a> Visit<'a> for JsVisitor<'a> {
         if urls::is_url(&it.value) {
             self.urls.insert(it.value.to_string());
         }
+    }
+
+    // vite's `const __vite__mapDeps = (i, m = ..., d = m.f || (m.f = [...])) => ...`
+    fn visit_variable_declarator(&mut self, it: &VariableDeclarator<'a>) {
+        self.chunk_urls.extend(vite::vite_chunk_urls(it));
+        walk::walk_variable_declarator(self, it);
     }
 }
